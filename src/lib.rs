@@ -123,6 +123,15 @@ pub fn link_program(
 }
 
 #[wasm_bindgen]
-pub fn load_gltf_model(model: String) -> Result<JsValue, JsValue> {
-    Ok(JsValue::from_str(&format!("Hello, {}!", model)))
+pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<JsValue, JsValue> {
+    let model = gltf::Gltf::from_slice(&gltf_bytes)
+        .map_err(|err| format!("error parsing gltf: {}", err))?;
+
+    let mut meshes = model.meshes();
+    let first_mesh = meshes.next().unwrap();
+
+    Ok(JsValue::from_str(&format!(
+        "Hello, world! model meshes is {:?}",
+        first_mesh.name(),
+    )))
 }

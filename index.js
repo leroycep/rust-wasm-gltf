@@ -2,10 +2,17 @@
 // example.
 import('./pkg')
   .then(m => {
-    console.log("hello, world!");
-    console.log(m);
-    console.log(m.load_gltf_model);
-    const s = m.load_gltf_model("hello, world!");
-    console.log(s);
+    fetch("/gltf/SheenChair.glb", { mode: 'no-cors' })
+      .then(resp => {
+        console.log(resp);
+        if (!resp.ok) {
+          throw "failed to download gltf model";
+        }
+        return resp.arrayBuffer();
+      })
+      .then(gltf_bytes => {
+        console.log(gltf_bytes);
+        console.log(m.load_gltf_model(new Uint8Array(gltf_bytes)));
+      })
   })
   .catch(console.error);
