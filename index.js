@@ -2,7 +2,7 @@
 // example.
 import('./pkg')
   .then(m => {
-    fetch("/gltf/SheenChair.glb", { mode: 'no-cors' })
+    fetch("/gltf/Stork.glb", { mode: 'no-cors' })
       .then(resp => {
         console.log(resp);
         if (!resp.ok) {

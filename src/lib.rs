@@ -1,3 +1,4 @@
+use std::io::Write;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{WebGlProgram, WebGlRenderingContext, WebGlShader};
@@ -124,14 +125,163 @@ pub fn link_program(
 
 #[wasm_bindgen]
 pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<JsValue, JsValue> {
-    let model = gltf::Gltf::from_slice(&gltf_bytes)
-        .map_err(|err| format!("error parsing gltf: {}", err))?;
+    let (document, buffers, images) =
+        gltf::import_slice(&gltf_bytes).map_err(|err| format!("error parsing gltf: {}", err))?;
 
-    let mut meshes = model.meshes();
-    let first_mesh = meshes.next().unwrap();
+    let mut text = Vec::new();
 
-    Ok(JsValue::from_str(&format!(
-        "Hello, world! model meshes is {:?}",
-        first_mesh.name(),
-    )))
+    let scene = document
+        .default_scene()
+        .ok_or_else(|| JsValue::from_str("gltf model does not have a default scene!"))?;
+
+    let mut bounds = [[0f32; 3]; 2];
+    let mut vertices = Vec::<f32>::new();
+    let mut indices = Vec::<u16>::new();
+
+    writeln!(&mut text, "nodes:").map_err(|err| format!("error writing: {}", err))?;
+    for mesh in document.meshes() {
+        for prim in mesh.primitives() {
+            writeln!(
+                &mut text,
+                "\tprimitive = {:?}; bounds = {:?}",
+                prim.mode(),
+                prim.bounding_box()
+            )
+            .map_err(|err| format!("error writing: {}", err))?;
+
+            let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
+            for pos in reader.read_positions().unwrap() {
+                vertices.push(pos[0]);
+                vertices.push(pos[1]);
+                vertices.push(pos[2]);
+
+                bounds[0][0] = bounds[0][0].min(pos[0]);
+                bounds[0][1] = bounds[0][1].min(pos[1]);
+                bounds[0][2] = bounds[0][2].min(pos[2]);
+
+                bounds[1][0] = bounds[1][0].max(pos[0]);
+                bounds[1][1] = bounds[1][1].max(pos[1]);
+                bounds[1][2] = bounds[1][2].max(pos[2]);
+            }
+            for index in reader.read_indices().unwrap().into_u32() {
+                indices.push(index as u16);
+            }
+        }
+    }
+    writeln!(
+        &mut text,
+        "Loaded {} vertices; bounds = {:#?}",
+        vertices.len() / 3,
+        bounds
+    )
+    .map_err(|err| format!("error writing: {}", err))?;
+
+    display_model(bounds, &vertices, &indices)?;
+
+    Ok(JsValue::from_str(&String::from_utf8_lossy(&text)))
+}
+
+pub fn display_model(
+    bounds: [[f32; 3]; 2],
+    vertices: &[f32],
+    indices: &[u16],
+) -> Result<(), JsValue> {
+    let document = web_sys::window().unwrap().document().unwrap();
+    let canvas = document.get_element_by_id("canvas").unwrap();
+    let canvas: web_sys::HtmlCanvasElement = canvas.dyn_into::<web_sys::HtmlCanvasElement>()?;
+
+    let context = canvas
+        .get_context("webgl")?
+        .unwrap()
+        .dyn_into::<WebGlRenderingContext>()?;
+
+    let vert_shader = compile_shader(
+        &context,
+        WebGlRenderingContext::VERTEX_SHADER,
+        r#"
+        uniform mat4 transform;
+        attribute vec3 position;
+        void main() {
+            gl_Position = transform * vec4(position, 1.0);
+        }
+    "#,
+    )?;
+    let frag_shader = compile_shader(
+        &context,
+        WebGlRenderingContext::FRAGMENT_SHADER,
+        r#"
+        void main() {
+            gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);
+        }
+    "#,
+    )?;
+    let program = link_program(&context, &vert_shader, &frag_shader)?;
+    context.use_program(Some(&program));
+
+    let transform_uniform = context
+        .get_uniform_location(&program, "transform")
+        .ok_or_else(|| JsValue::from_str("Could not get transform uniform location"))?;
+
+    let buffer = context.create_buffer().ok_or("failed to create buffer")?;
+    context.bind_buffer(WebGlRenderingContext::ARRAY_BUFFER, Some(&buffer));
+
+    let index_buffer = context
+        .create_buffer()
+        .ok_or("failed to create index buffer")?;
+    context.bind_buffer(
+        WebGlRenderingContext::ELEMENT_ARRAY_BUFFER,
+        Some(&index_buffer),
+    );
+
+    // Note that `Float32Array::view` is somewhat dangerous (hence the
+    // `unsafe`!). This is creating a raw view into our module's
+    // `WebAssembly.Memory` buffer, but if we allocate more pages for ourself
+    // (aka do a memory allocation in Rust) it'll cause the buffer to change,
+    // causing the `Float32Array` to be invalid.
+    //
+    // As a result, after `Float32Array::view` we have to be very careful not to
+    // do any memory allocations before it's dropped.
+    unsafe {
+        let vert_array = js_sys::Float32Array::view(vertices);
+
+        context.buffer_data_with_array_buffer_view(
+            WebGlRenderingContext::ARRAY_BUFFER,
+            &vert_array,
+            WebGlRenderingContext::STATIC_DRAW,
+        );
+
+        let index_array = js_sys::Uint16Array::view(indices);
+
+        context.buffer_data_with_array_buffer_view(
+            WebGlRenderingContext::ELEMENT_ARRAY_BUFFER,
+            &index_array,
+            WebGlRenderingContext::STATIC_DRAW,
+        );
+    }
+
+    context.vertex_attrib_pointer_with_i32(0, 3, WebGlRenderingContext::FLOAT, false, 0, 0);
+    context.enable_vertex_attrib_array(0);
+
+    context.clear_color(0.0, 0.0, 0.0, 1.0);
+    context.clear(WebGlRenderingContext::COLOR_BUFFER_BIT);
+
+    context.uniform_matrix4fv_with_f32_array(
+        Some(&transform_uniform),
+        false,
+        &[
+            // Column Major
+            0.01, 0.0, 0.0, 0.0, //
+            0.0, 0.01, 0.0, 0.0, //
+            0.0, 0.0, 0.01, 0.0, //
+            0.0, 0.0, 0.0, 1.0, //
+        ],
+    );
+
+    context.draw_elements_with_i32(
+        WebGlRenderingContext::TRIANGLES,
+        (indices.len() / 3) as i32,
+        WebGlRenderingContext::UNSIGNED_SHORT,
+        0,
+    );
+    Ok(())
 }
