@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::io::Write;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -126,30 +125,21 @@ pub fn link_program(
 }
 
 #[wasm_bindgen]
-pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<JsValue, JsValue> {
-    let (document, buffers, images) =
+pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<(), JsValue> {
+    let (document, buffers, _images) =
         gltf::import_slice(&gltf_bytes).map_err(|err| format!("error parsing gltf: {}", err))?;
-
-    let mut text = Vec::new();
-
-    let scene = document
-        .default_scene()
-        .ok_or_else(|| JsValue::from_str("gltf model does not have a default scene!"))?;
 
     let mut bounds = [[0f32; 3]; 2];
     let mut vertices = Vec::<f32>::new();
     let mut indices = Vec::<u16>::new();
 
-    writeln!(&mut text, "nodes:").map_err(|err| format!("error writing: {}", err))?;
     for mesh in document.meshes() {
         for prim in mesh.primitives() {
-            writeln!(
-                &mut text,
+            log(&format!(
                 "\tprimitive = {:?}; bounds = {:?}",
                 prim.mode(),
                 prim.bounding_box()
-            )
-            .map_err(|err| format!("error writing: {}", err))?;
+            ));
 
             let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
             for pos in reader.read_positions().unwrap() {
@@ -170,17 +160,17 @@ pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<JsValue, JsValue> {
             }
         }
     }
-    writeln!(
-        &mut text,
-        "Loaded {} vertices; bounds = {:#?}",
+
+    log(&format!(
+        "Loaded {} vertices, {} indices; bounds = {:#?}",
         vertices.len() / 3,
-        bounds
-    )
-    .map_err(|err| format!("error writing: {}", err))?;
+        indices.len(),
+        bounds,
+    ));
 
     display_model(bounds, &vertices, &indices)?;
 
-    Ok(JsValue::from_str(&String::from_utf8_lossy(&text)))
+    Ok(())
 }
 
 pub fn display_model(
@@ -227,14 +217,6 @@ pub fn display_model(
     let buffer = context.create_buffer().ok_or("failed to create buffer")?;
     context.bind_buffer(WebGlRenderingContext::ARRAY_BUFFER, Some(&buffer));
 
-    let index_buffer = context
-        .create_buffer()
-        .ok_or("failed to create index buffer")?;
-    context.bind_buffer(
-        WebGlRenderingContext::ELEMENT_ARRAY_BUFFER,
-        Some(&index_buffer),
-    );
-
     // Note that `Float32Array::view` is somewhat dangerous (hence the
     // `unsafe`!). This is creating a raw view into our module's
     // `WebAssembly.Memory` buffer, but if we allocate more pages for ourself
@@ -251,7 +233,17 @@ pub fn display_model(
             &vert_array,
             WebGlRenderingContext::STATIC_DRAW,
         );
+    }
 
+    let index_buffer = context
+        .create_buffer()
+        .ok_or("failed to create index buffer")?;
+    context.bind_buffer(
+        WebGlRenderingContext::ELEMENT_ARRAY_BUFFER,
+        Some(&index_buffer),
+    );
+
+    unsafe {
         let index_array = js_sys::Uint16Array::view(indices);
 
         context.buffer_data_with_array_buffer_view(
@@ -271,7 +263,8 @@ pub fn display_model(
 
     let mut i: u64 = 0;
     *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
-        i += 1;
+        context.clear_color(0.0, 0.0, 0.0, 1.0);
+        context.clear(WebGlRenderingContext::COLOR_BUFFER_BIT);
 
         let theta = (i as f32) / 60.0;
         let tcos = theta.cos();
@@ -294,9 +287,6 @@ pub fn display_model(
             ],
         );
 
-        context.clear_color(0.0, 0.0, 0.0, 1.0);
-        context.clear(WebGlRenderingContext::COLOR_BUFFER_BIT);
-
         context.uniform_matrix4fv_with_f32_array(Some(&transform_uniform), false, &transform);
 
         context.draw_elements_with_i32(
@@ -306,6 +296,7 @@ pub fn display_model(
             0,
         );
 
+        i += 1;
         request_animation_frame(f.borrow().as_ref().unwrap());
     }) as Box<dyn FnMut()>));
 

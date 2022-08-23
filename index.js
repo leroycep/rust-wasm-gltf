@@ -11,8 +11,7 @@ import('./pkg')
         return resp.arrayBuffer();
       })
       .then(gltf_bytes => {
-        console.log(gltf_bytes);
-        console.log(m.load_gltf_model(new Uint8Array(gltf_bytes)));
+        m.load_gltf_model(new Uint8Array(gltf_bytes));
       })
   })
   .catch(console.error);
