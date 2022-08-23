@@ -256,7 +256,7 @@ pub fn display_model(
     context.vertex_attrib_pointer_with_i32(0, 3, WebGlRenderingContext::FLOAT, false, 0, 0);
     context.enable_vertex_attrib_array(0);
 
-    let num_indices = (indices.len() / 3) as i32;
+    let num_indices = (indices.len()) as i32;
 
     let f = Rc::new(RefCell::new(None));
     let g = f.clone();
