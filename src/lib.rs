@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::io::Write;
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{WebGlProgram, WebGlRenderingContext, WebGlShader};
@@ -262,26 +264,85 @@ pub fn display_model(
     context.vertex_attrib_pointer_with_i32(0, 3, WebGlRenderingContext::FLOAT, false, 0, 0);
     context.enable_vertex_attrib_array(0);
 
-    context.clear_color(0.0, 0.0, 0.0, 1.0);
-    context.clear(WebGlRenderingContext::COLOR_BUFFER_BIT);
+    let num_indices = (indices.len() / 3) as i32;
 
-    context.uniform_matrix4fv_with_f32_array(
-        Some(&transform_uniform),
-        false,
-        &[
-            // Column Major
-            0.01, 0.0, 0.0, 0.0, //
-            0.0, 0.01, 0.0, 0.0, //
-            0.0, 0.0, 0.01, 0.0, //
-            0.0, 0.0, 0.0, 1.0, //
-        ],
-    );
+    let f = Rc::new(RefCell::new(None));
+    let g = f.clone();
 
-    context.draw_elements_with_i32(
-        WebGlRenderingContext::TRIANGLES,
-        (indices.len() / 3) as i32,
-        WebGlRenderingContext::UNSIGNED_SHORT,
-        0,
-    );
+    let mut i: u64 = 0;
+    *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
+        i += 1;
+
+        let theta = (i as f32) / 60.0;
+        let tcos = theta.cos();
+        let tsin = theta.sin();
+
+        let transform = mat4_mul(
+            // Scale down model to fit in viewport
+            [
+                0.01, 0.0, 0.0, 0.0, //
+                0.0, 0.01, 0.0, 0.0, //
+                0.0, 0.0, 0.01, 0.0, //
+                0.0, 0.0, 0.0, 1.0, //
+            ],
+            // Rotate the model
+            [
+                tcos, 0.0, tsin, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                -tsin, 0.0, tcos, 0.0, //
+                0.0, 0.0, 0.0, 1.0, //
+            ],
+        );
+
+        context.clear_color(0.0, 0.0, 0.0, 1.0);
+        context.clear(WebGlRenderingContext::COLOR_BUFFER_BIT);
+
+        context.uniform_matrix4fv_with_f32_array(Some(&transform_uniform), false, &transform);
+
+        context.draw_elements_with_i32(
+            WebGlRenderingContext::TRIANGLES,
+            num_indices,
+            WebGlRenderingContext::UNSIGNED_SHORT,
+            0,
+        );
+
+        request_animation_frame(f.borrow().as_ref().unwrap());
+    }) as Box<dyn FnMut()>));
+
+    request_animation_frame(g.borrow().as_ref().unwrap());
     Ok(())
+}
+
+fn window() -> web_sys::Window {
+    web_sys::window().expect("no global `window` exists")
+}
+
+fn request_animation_frame(f: &Closure<dyn FnMut()>) {
+    window()
+        .request_animation_frame(f.as_ref().unchecked_ref())
+        .expect("should register `requestAnimationFrame` OK");
+}
+
+#[wasm_bindgen]
+extern "C" {
+    // Use `js_namespace` here to bind `console.log(..)` instead of just
+    // `log(..)`
+    #[wasm_bindgen(js_namespace = console)]
+    fn log(s: &str);
+
+}
+
+fn mat4_mul(left: [f32; 4 * 4], right: [f32; 4 * 4]) -> [f32; 4 * 4] {
+    let mut res = [0.0; 4 * 4];
+    for i in 0..4 {
+        for j in 0..4 {
+            let res_index = j * 4 + i;
+            for k in 0..4 {
+                let left_index = i * 4 + k;
+                let right_index = k * 4 + j;
+                res[res_index] += left[left_index] * right[right_index];
+            }
+        }
+    }
+    res
 }
