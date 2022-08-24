@@ -76,32 +76,27 @@ pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<(), JsValue> {
         meshes.push(load_mesh(&mesh, &buffers));
 
         log(&format!(
-            "Loaded {} vertices, {} indices; bounds = {:#?}",
+            "Loaded {} vertices, {} indices; min = {}, max = {}",
             meshes.last().unwrap().vertices.len() / 3,
             meshes.last().unwrap().indices.len(),
-            meshes.last().unwrap().bounds,
+            meshes.last().unwrap().min,
+            meshes.last().unwrap().max,
         ));
     }
 
     let mut model = Vec::new();
-    let mut camera = None;
     if let Some(scene) = document.default_scene() {
         for node in scene.nodes() {
             model.extend(load_scene_nodes(&node));
-            camera = load_scene_camera(&node);
         }
     }
 
-    Ok(display_model(&meshes, model, camera)?)
+    Ok(display_model(&meshes, model)?)
 }
 
 static QUIT_RENDERING: AtomicBool = AtomicBool::new(false);
 
-fn display_model(
-    meshes: &[VertexMesh],
-    model: Vec<VertexMeshInstance>,
-    camera_opt: Option<Camera>,
-) -> Result<(), JsValue> {
+fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Result<(), JsValue> {
     let document = web_sys::window().unwrap().document().unwrap();
     let canvas = document.get_element_by_id("canvas").unwrap();
     let canvas: web_sys::HtmlCanvasElement = canvas.dyn_into::<web_sys::HtmlCanvasElement>()?;
@@ -144,9 +139,9 @@ fn display_model(
         varying vec3 vert_normal;
         varying vec3 view_space_position;
 
-        const float ambient_strength = 0.1;
+        const float ambient_strength = 0.4;
         const float specular_strength = 0.5;
-        const vec3 light_color = vec3(0.8, 0.8, 0.8);
+        const vec3 light_color = vec3(1.0);
         const vec3 object_color = vec3(136.0 / 255.0);
         const float alpha = 1.0;
         const vec3 light_pos = vec3(-100.0, 100.0, 0.0);
@@ -194,31 +189,36 @@ fn display_model(
         .get_uniform_location(&line_program, "view")
         .ok_or_else(|| JsValue::from_str("Could not get transform uniform location"))?;
 
-    let mut furthest: f32 = 0.01;
-
     let mut gpu_meshes = Vec::new();
     // Upload meshes
     for mesh in meshes {
         gpu_meshes.push(upload_mesh_to_gpu(&context, mesh)?);
-
-        for pos in mesh.bounds {
-            for coord in pos {
-                furthest = furthest.max(coord);
-            }
-        }
     }
 
-    let camera = camera_opt.unwrap_or(Camera {
-        translation: glam::f32::vec3(0.0, 0.0, furthest),
-        rotation: glam::f32::vec4(0.0, 0.0, 0.0, 1.0),
-        aspect: 640.0 / 480.0,
-        fov: f32::to_radians(45.0),
-        near: 0.01,
-        far: 100.0,
-    });
+    let mut min = glam::vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut max = glam::vec3(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for mesh_instance in &model {
+        log(&format!("transform = {}", mesh_instance.transform));
+        min = min.min(
+            mesh_instance
+                .transform
+                .transform_point3(meshes[mesh_instance.index].min),
+        );
+        max = max.max(
+            mesh_instance
+                .transform
+                .transform_point3(meshes[mesh_instance.index].max),
+        );
+    }
+    let size = (max - min).max_element();
+    let center = (min + max) / 2.0;
+    log(&format!("size = {}, center = {}", size, center));
+
+    let model_scale = glam::f32::Mat4::from_scale(glam::Vec3::splat(1.0 / size));
+    let model_offset = glam::f32::Mat4::from_translation(-center);
+
     let projection =
-        glam::f32::Mat4::perspective_infinite_rh(camera.fov, camera.aspect, camera.near);
-    log(&format!("camera = {:?}", camera));
+        glam::f32::Mat4::perspective_infinite_rh(f32::to_radians(45.0), 640.0 / 480.0, 0.01);
 
     let f = Rc::new(RefCell::new(None));
     let g = f.clone();
@@ -244,9 +244,9 @@ fn display_model(
         );
 
         let theta = (i as f32) / 60.0;
-        let radius = camera.translation.length();
+        let radius = 1.5;
         let view_matrix = glam::f32::Mat4::look_at_rh(
-            glam::vec3(theta.sin() * radius, 0.0, theta.cos() * radius),
+            glam::vec3(theta.sin() * radius, 0.5, theta.cos() * radius),
             glam::vec3(0.0, 0.0, 0.0),
             glam::vec3(0.0, 1.0, 0.0),
         );
@@ -266,11 +266,13 @@ fn display_model(
         for instance in &model {
             let gpu_mesh = &gpu_meshes[instance.index];
 
+            let model_transform = model_scale * model_offset * instance.transform;
+
             // Render faces
             context.uniform_matrix4fv_with_f32_array(
                 Some(&model_transform_uniform),
                 false,
-                &instance.transform,
+                &model_transform.to_cols_array(),
             );
             context.bind_buffer(
                 WebGl2RenderingContext::ARRAY_BUFFER,
@@ -346,44 +348,9 @@ extern "C" {
 
 }
 
-fn mat4_mul(left: [f32; 4 * 4], right: [f32; 4 * 4]) -> [f32; 4 * 4] {
-    let mut res = [0.0; 4 * 4];
-    for i in 0..4 {
-        for j in 0..4 {
-            let res_index = j * 4 + i;
-            for k in 0..4 {
-                let left_index = i * 4 + k;
-                let right_index = k * 4 + j;
-                res[res_index] += left[left_index] * right[right_index];
-            }
-        }
-    }
-    res
-}
-
-fn mat4_gltf_to_flat(gltf_matrix: [[f32; 4]; 4]) -> [f32; 4 * 4] {
-    let mut res = [0.0; 4 * 4];
-    for i in 0..4 {
-        for j in 0..4 {
-            let res_index = j * 4 + i;
-            res[res_index] = gltf_matrix[j][i];
-        }
-    }
-    res
-}
-
-fn mat4_identity() -> [f32; 4 * 4] {
-    [
-        1.0, 0.0, 0.0, 0.0, //
-        0.0, 1.0, 0.0, 0.0, //
-        0.0, 0.0, 1.0, 0.0, //
-        0.0, 0.0, 0.0, 1.0, //
-    ]
-}
-
 struct VertexMeshInstance {
     index: usize,
-    transform: [f32; 4 * 4],
+    transform: glam::f32::Mat4,
 }
 
 fn load_scene_nodes(gltf_node: &gltf::Node) -> Vec<VertexMeshInstance> {
@@ -392,14 +359,19 @@ fn load_scene_nodes(gltf_node: &gltf::Node) -> Vec<VertexMeshInstance> {
         log("Node has a camera! Ignored, as cameras are not yet implemented");
     }
 
-    let transform = mat4_gltf_to_flat(gltf_node.transform().matrix());
+    let (translation, rotation, scale) = gltf_node.transform().decomposed();
+    let transform = glam::Mat4::from_scale_rotation_translation(
+        glam::Vec3::from(scale),
+        glam::Quat::from_array(rotation),
+        glam::Vec3::from(translation),
+    );
     let mut nodes = Vec::new();
     for child in gltf_node.children() {
         nodes.extend(load_scene_nodes(&child));
     }
 
     for node in &mut nodes {
-        node.transform = mat4_mul(transform, node.transform);
+        node.transform = transform * node.transform;
     }
 
     if let Some(mesh) = gltf_node.mesh() {
@@ -411,61 +383,16 @@ fn load_scene_nodes(gltf_node: &gltf::Node) -> Vec<VertexMeshInstance> {
     nodes
 }
 
-#[derive(Debug)]
-struct Camera {
-    translation: glam::f32::Vec3,
-    rotation: glam::f32::Vec4,
-    aspect: f32,
-    fov: f32,
-    far: f32,
-    near: f32,
-}
-
-fn load_scene_camera(gltf_node: &gltf::Node) -> Option<Camera> {
-    let (v_translation, v_rotation, _) = gltf_node.transform().decomposed();
-    let translation = glam::f32::Vec3::from(v_translation);
-    let rotation = glam::f32::Vec4::from(v_rotation);
-
-    let mut camera = None;
-    for child in gltf_node.children() {
-        camera = load_scene_camera(&child);
-    }
-
-    if let Some(cam) = gltf_node.camera() {
-        match cam.projection() {
-            gltf::camera::Projection::Perspective(perspective) => {
-                camera = Some(Camera {
-                    translation: glam::f32::Vec3::ZERO,
-                    rotation: glam::f32::Vec4::new(0.0, 0.0, 0.0, 1.0),
-                    aspect: perspective.aspect_ratio().unwrap_or(640.0 / 480.0),
-                    fov: perspective.yfov(),
-                    far: perspective.zfar().unwrap_or(100.0),
-                    near: perspective.znear(),
-                });
-            }
-
-            _ => {}
-        }
-    }
-
-    camera.map(|c| Camera {
-        translation: translation + c.translation,
-        rotation: rotation * c.rotation,
-        aspect: c.aspect,
-        fov: c.fov,
-        far: c.far,
-        near: c.near,
-    })
-}
-
 struct VertexMesh {
-    bounds: [[f32; 3]; 2],
+    min: glam::f32::Vec3,
+    max: glam::f32::Vec3,
     vertices: Vec<f32>,
     indices: Vec<u16>,
 }
 
 fn load_mesh(gltf_mesh: &Mesh, buffers: &[gltf::buffer::Data]) -> VertexMesh {
-    let mut bounds = [[0f32; 3]; 2];
+    let mut min = glam::f32::Vec3::ZERO;
+    let mut max = glam::f32::Vec3::ZERO;
     let mut vertices = Vec::<f32>::new();
     let mut indices = Vec::<u16>::new();
 
@@ -477,6 +404,9 @@ fn load_mesh(gltf_mesh: &Mesh, buffers: &[gltf::buffer::Data]) -> VertexMesh {
         ));
 
         let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
+        for index in reader.read_indices().unwrap().into_u32() {
+            indices.push(index as u16);
+        }
         if let Some(normal_reader) = reader.read_normals() {
             log(&format!("Model has normals"));
             for (pos, normal) in reader.read_positions().unwrap().zip(normal_reader) {
@@ -487,40 +417,55 @@ fn load_mesh(gltf_mesh: &Mesh, buffers: &[gltf::buffer::Data]) -> VertexMesh {
                 vertices.push(normal[1]);
                 vertices.push(normal[2]);
 
-                bounds[0][0] = bounds[0][0].min(pos[0]);
-                bounds[0][1] = bounds[0][1].min(pos[1]);
-                bounds[0][2] = bounds[0][2].min(pos[2]);
-
-                bounds[1][0] = bounds[1][0].max(pos[0]);
-                bounds[1][1] = bounds[1][1].max(pos[1]);
-                bounds[1][2] = bounds[1][2].max(pos[2]);
+                min = min.min(glam::Vec3::from_array(pos));
+                max = max.max(glam::Vec3::from_array(pos));
             }
         } else {
             for pos in reader.read_positions().unwrap() {
                 vertices.push(pos[0]);
                 vertices.push(pos[1]);
                 vertices.push(pos[2]);
-                // TODO: Automatically calculate normals if there are none
                 vertices.push(0.0);
                 vertices.push(0.0);
                 vertices.push(0.0);
 
-                bounds[0][0] = bounds[0][0].min(pos[0]);
-                bounds[0][1] = bounds[0][1].min(pos[1]);
-                bounds[0][2] = bounds[0][2].min(pos[2]);
-
-                bounds[1][0] = bounds[1][0].max(pos[0]);
-                bounds[1][1] = bounds[1][1].max(pos[1]);
-                bounds[1][2] = bounds[1][2].max(pos[2]);
+                min = min.min(glam::Vec3::from_array(pos));
+                max = max.max(glam::Vec3::from_array(pos));
             }
-        }
-        for index in reader.read_indices().unwrap().into_u32() {
-            indices.push(index as u16);
+
+            // Automatically calculate normals
+            for i in 0..indices.len() / 3 {
+                let triangle_indices = &indices[i * 3 as usize..][0..3];
+                let triangle_pos = [
+                    glam::Vec3::from_slice(&vertices[(6 * triangle_indices[0]) as usize..][0..3]),
+                    glam::Vec3::from_slice(&vertices[(6 * triangle_indices[1]) as usize..][0..3]),
+                    glam::Vec3::from_slice(&vertices[(6 * triangle_indices[2]) as usize..][0..3]),
+                ];
+                let face_normal = (triangle_pos[2] - triangle_pos[0])
+                    .cross(triangle_pos[1] - triangle_pos[0])
+                    .to_array();
+                for index in triangle_indices {
+                    let offset = (6 * index) as usize;
+                    let triangle_verts = &mut vertices[offset..][3..6];
+                    for component in 0..3 {
+                        triangle_verts[component] += face_normal[component];
+                    }
+                }
+            }
+
+            for i in 0..vertices.len() / 6 {
+                let offset = (6 * i) as usize;
+                let normal_sums = &mut vertices[offset..][3..6];
+
+                let normal = glam::Vec3::from_slice(&normal_sums).normalize();
+                normal.write_to_slice(normal_sums);
+            }
         }
     }
 
     VertexMesh {
-        bounds,
+        min,
+        max,
         vertices,
         indices,
     }
