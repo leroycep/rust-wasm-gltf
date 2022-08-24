@@ -1,4 +1,6 @@
+use gltf::Mesh;
 use std::cell::RefCell;
+use std::mem::size_of;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -66,65 +68,27 @@ pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<(), JsValue> {
     let (document, buffers, _images) =
         gltf::import_slice(&gltf_bytes).map_err(|err| format!("error parsing gltf: {}", err))?;
 
-    let mut bounds = [[0f32; 3]; 2];
-    let mut vertices = Vec::<f32>::new();
-    let mut normals = Vec::<f32>::new();
-    let mut indices = Vec::<u16>::new();
+    let mut meshes = Vec::new();
 
     for mesh in document.meshes() {
         log(&format!("reading mesh; name = {:?}", mesh.name()));
 
-        for prim in mesh.primitives() {
-            log(&format!(
-                "\tprimitive = {:?}; bounds = {:?}",
-                prim.mode(),
-                prim.bounding_box()
-            ));
+        meshes.push(load_mesh(&mesh, &buffers));
 
-            let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
-            for pos in reader.read_positions().unwrap() {
-                vertices.push(pos[0]);
-                vertices.push(pos[1]);
-                vertices.push(pos[2]);
-
-                bounds[0][0] = bounds[0][0].min(pos[0]);
-                bounds[0][1] = bounds[0][1].min(pos[1]);
-                bounds[0][2] = bounds[0][2].min(pos[2]);
-
-                bounds[1][0] = bounds[1][0].max(pos[0]);
-                bounds[1][1] = bounds[1][1].max(pos[1]);
-                bounds[1][2] = bounds[1][2].max(pos[2]);
-            }
-            if let Some(normal_reader) = reader.read_normals() {
-                for normal in normal_reader {
-                    vertices.push(normal[0]);
-                    vertices.push(normal[1]);
-                    vertices.push(normal[2]);
-                }
-            }
-            for index in reader.read_indices().unwrap().into_u32() {
-                indices.push(index as u16);
-            }
-        }
+        log(&format!(
+            "Loaded {} vertices, {} indices; bounds = {:#?}",
+            meshes.last().unwrap().vertices.len() / 3,
+            meshes.last().unwrap().indices.len(),
+            meshes.last().unwrap().bounds,
+        ));
     }
 
-    log(&format!(
-        "Loaded {} vertices, {} indices; bounds = {:#?}",
-        vertices.len() / 3,
-        indices.len(),
-        bounds,
-    ));
-
-    Ok(display_model(bounds, &vertices, &indices)?)
+    Ok(display_model(&meshes)?)
 }
 
 static QUIT_RENDERING: AtomicBool = AtomicBool::new(false);
 
-pub fn display_model(
-    bounds: [[f32; 3]; 2],
-    vertices: &[f32],
-    indices: &[u16],
-) -> Result<(), JsValue> {
+fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
     let document = web_sys::window().unwrap().document().unwrap();
     let canvas = document.get_element_by_id("canvas").unwrap();
     let canvas: web_sys::HtmlCanvasElement = canvas.dyn_into::<web_sys::HtmlCanvasElement>()?;
@@ -140,12 +104,15 @@ pub fn display_model(
         r#"
         uniform mat4 transform;
         attribute vec3 position;
-        
+        attribute vec3 aNormal;
+
         varying vec3 vert_pos;
-        
+        varying vec3 vert_normal;
+
         void main() {
-            vert_pos = (transform * vec4(position, 1.0)).xyz;
-            gl_Position = vec4(vert_pos, 1.0);
+            vert_pos = position;
+            vert_normal = aNormal;
+            gl_Position = transform * vec4(position, 1.0);
         }
     "#,
     )?;
@@ -153,75 +120,60 @@ pub fn display_model(
         &context,
         WebGlRenderingContext::FRAGMENT_SHADER,
         r#"
+        varying mediump vec3 vert_pos;
+        varying mediump vec3 vert_normal;
+
         const mediump float ambient_strength = 0.1;
         const mediump vec3 light_color = vec3(0.8, 0.8, 0.8);
         const mediump vec3 object_color = vec3(136.0 / 255.0);
         const mediump float alpha = 1.0;
+        const mediump vec3 light_pos = vec3(-100.0, 100.0, 0.0);
 
         void main() {
             mediump vec3 ambient = ambient_strength * light_color;
         
-            gl_FragColor = vec4(ambient * object_color, alpha);
+            mediump vec3 light_dir = normalize(light_pos - vert_pos);
+            mediump float diffuse_strength = max(dot(normalize(vert_normal), light_dir), 0.0);
+            mediump vec3 diffuse = diffuse_strength * light_color;
+        
+            gl_FragColor = vec4((ambient + diffuse) * object_color, alpha);
         }
     "#,
     )?;
     let program = link_program(&context, &vert_shader, &frag_shader)?;
     context.use_program(Some(&program));
-
     let transform_uniform = context
         .get_uniform_location(&program, "transform")
         .ok_or_else(|| JsValue::from_str("Could not get transform uniform location"))?;
 
-    let buffer = context.create_buffer().ok_or("failed to create buffer")?;
-    context.bind_buffer(WebGlRenderingContext::ARRAY_BUFFER, Some(&buffer));
+    let line_frag_shader = compile_shader(
+        &context,
+        WebGlRenderingContext::FRAGMENT_SHADER,
+        r#"
+        void main() {
+            gl_FragColor = vec4(0.0, 0.0, 0.4, 0.0);
+        }
+    "#,
+    )?;
+    let line_program = link_program(&context, &vert_shader, &line_frag_shader)?;
+    let line_transform_uniform = context
+        .get_uniform_location(&line_program, "transform")
+        .ok_or_else(|| JsValue::from_str("Could not get transform uniform location"))?;
 
-    // Note that `Float32Array::view` is somewhat dangerous (hence the
-    // `unsafe`!). This is creating a raw view into our module's
-    // `WebAssembly.Memory` buffer, but if we allocate more pages for ourself
-    // (aka do a memory allocation in Rust) it'll cause the buffer to change,
-    // causing the `Float32Array` to be invalid.
-    //
-    // As a result, after `Float32Array::view` we have to be very careful not to
-    // do any memory allocations before it's dropped.
-    unsafe {
-        let vert_array = js_sys::Float32Array::view(vertices);
+    let mut furthest: f32 = 0.01;
 
-        context.buffer_data_with_array_buffer_view(
-            WebGlRenderingContext::ARRAY_BUFFER,
-            &vert_array,
-            WebGlRenderingContext::STATIC_DRAW,
-        );
-    }
+    let mut gpu_meshes = Vec::new();
+    // Upload meshes
+    for mesh in meshes {
+        gpu_meshes.push(upload_mesh_to_gpu(&context, mesh)?);
 
-    let index_buffer = context
-        .create_buffer()
-        .ok_or("failed to create index buffer")?;
-    context.bind_buffer(
-        WebGlRenderingContext::ELEMENT_ARRAY_BUFFER,
-        Some(&index_buffer),
-    );
-
-    unsafe {
-        let index_array = js_sys::Uint16Array::view(indices);
-
-        context.buffer_data_with_array_buffer_view(
-            WebGlRenderingContext::ELEMENT_ARRAY_BUFFER,
-            &index_array,
-            WebGlRenderingContext::STATIC_DRAW,
-        );
-    }
-
-    context.vertex_attrib_pointer_with_i32(0, 3, WebGlRenderingContext::FLOAT, false, 0, 0);
-    context.enable_vertex_attrib_array(0);
-
-    let num_indices = (indices.len()) as i32;
-
-    let mut furthest = bounds[0][0];
-    for pos in bounds {
-        for coord in pos {
-            furthest = furthest.max(coord);
+        for pos in mesh.bounds {
+            for coord in pos {
+                furthest = furthest.max(coord);
+            }
         }
     }
+
     let scale = 1.0 / furthest;
 
     let f = Rc::new(RefCell::new(None));
@@ -237,8 +189,15 @@ pub fn display_model(
             return;
         }
 
+        context.enable(WebGlRenderingContext::CULL_FACE);
+        context.cull_face(WebGlRenderingContext::FRONT);
+
+        context.enable(WebGlRenderingContext::DEPTH_TEST);
+
         context.clear_color(0.0, 0.0, 0.0, 1.0);
-        context.clear(WebGlRenderingContext::COLOR_BUFFER_BIT);
+        context.clear(
+            WebGlRenderingContext::COLOR_BUFFER_BIT | WebGlRenderingContext::DEPTH_BUFFER_BIT,
+        );
 
         let theta = (i as f32) / 60.0;
         let tcos = theta.cos();
@@ -261,14 +220,48 @@ pub fn display_model(
             ],
         );
 
-        context.uniform_matrix4fv_with_f32_array(Some(&transform_uniform), false, &transform);
+        for gpu_mesh in &gpu_meshes {
+            // Render faces
+            context.use_program(Some(&program));
+            context.uniform_matrix4fv_with_f32_array(Some(&transform_uniform), false, &transform);
+            context.bind_buffer(
+                WebGlRenderingContext::ARRAY_BUFFER,
+                Some(&gpu_mesh.vertex_buffer),
+            );
+            context.bind_buffer(
+                WebGlRenderingContext::ELEMENT_ARRAY_BUFFER,
+                Some(&gpu_mesh.index_buffer),
+            );
 
-        context.draw_elements_with_i32(
-            WebGlRenderingContext::TRIANGLES,
-            num_indices,
-            WebGlRenderingContext::UNSIGNED_SHORT,
-            0,
-        );
+            let position_attribute = context.get_attrib_location(&program, "position");
+            let normal_attribute = context.get_attrib_location(&program, "aNormal");
+
+            context.vertex_attrib_pointer_with_i32(
+                position_attribute as u32,
+                3,
+                WebGlRenderingContext::FLOAT,
+                false,
+                (6 * size_of::<f32>()) as i32,
+                0,
+            );
+            context.enable_vertex_attrib_array(position_attribute as u32);
+            context.vertex_attrib_pointer_with_i32(
+                normal_attribute as u32,
+                3,
+                WebGlRenderingContext::FLOAT,
+                false,
+                (6 * size_of::<f32>()) as i32,
+                (3 * size_of::<f32>()) as i32,
+            );
+            context.enable_vertex_attrib_array(normal_attribute as u32);
+
+            context.draw_elements_with_i32(
+                WebGlRenderingContext::TRIANGLES,
+                gpu_mesh.num_indices,
+                WebGlRenderingContext::UNSIGNED_SHORT,
+                0,
+            );
+        }
 
         i += 1;
 
@@ -318,4 +311,128 @@ fn mat4_mul(left: [f32; 4 * 4], right: [f32; 4 * 4]) -> [f32; 4 * 4] {
         }
     }
     res
+}
+
+struct VertexMesh {
+    bounds: [[f32; 3]; 2],
+    vertices: Vec<f32>,
+    indices: Vec<u16>,
+}
+
+fn load_mesh(gltf_mesh: &Mesh, buffers: &[gltf::buffer::Data]) -> VertexMesh {
+    let mut bounds = [[0f32; 3]; 2];
+    let mut vertices = Vec::<f32>::new();
+    let mut indices = Vec::<u16>::new();
+
+    for prim in gltf_mesh.primitives() {
+        log(&format!(
+            "\tprimitive = {:?}; bounds = {:?}",
+            prim.mode(),
+            prim.bounding_box()
+        ));
+
+        let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
+        if let Some(normal_reader) = reader.read_normals() {
+            log(&format!("Model has normals"));
+            for (pos, normal) in reader.read_positions().unwrap().zip(normal_reader) {
+                vertices.push(pos[0]);
+                vertices.push(pos[1]);
+                vertices.push(pos[2]);
+                vertices.push(normal[0]);
+                vertices.push(normal[1]);
+                vertices.push(normal[2]);
+
+                bounds[0][0] = bounds[0][0].min(pos[0]);
+                bounds[0][1] = bounds[0][1].min(pos[1]);
+                bounds[0][2] = bounds[0][2].min(pos[2]);
+
+                bounds[1][0] = bounds[1][0].max(pos[0]);
+                bounds[1][1] = bounds[1][1].max(pos[1]);
+                bounds[1][2] = bounds[1][2].max(pos[2]);
+            }
+        } else {
+            for pos in reader.read_positions().unwrap() {
+                vertices.push(pos[0]);
+                vertices.push(pos[1]);
+                vertices.push(pos[2]);
+                // TODO: Automatically calculate normals if there are none
+                vertices.push(0.0);
+                vertices.push(0.0);
+                vertices.push(0.0);
+
+                bounds[0][0] = bounds[0][0].min(pos[0]);
+                bounds[0][1] = bounds[0][1].min(pos[1]);
+                bounds[0][2] = bounds[0][2].min(pos[2]);
+
+                bounds[1][0] = bounds[1][0].max(pos[0]);
+                bounds[1][1] = bounds[1][1].max(pos[1]);
+                bounds[1][2] = bounds[1][2].max(pos[2]);
+            }
+        }
+        for index in reader.read_indices().unwrap().into_u32() {
+            indices.push(index as u16);
+        }
+    }
+
+    VertexMesh {
+        bounds,
+        vertices,
+        indices,
+    }
+}
+
+struct GpuMesh {
+    vertex_buffer: web_sys::WebGlBuffer,
+    index_buffer: web_sys::WebGlBuffer,
+    num_indices: i32,
+}
+
+fn upload_mesh_to_gpu(
+    context: &WebGlRenderingContext,
+    mesh: &VertexMesh,
+) -> Result<GpuMesh, JsValue> {
+    let vertex_buffer = context.create_buffer().ok_or("failed to create buffer")?;
+    context.bind_buffer(WebGlRenderingContext::ARRAY_BUFFER, Some(&vertex_buffer));
+
+    // Note that `Float32Array::view` is somewhat dangerous (hence the
+    // `unsafe`!). This is creating a raw view into our module's
+    // `WebAssembly.Memory` buffer, but if we allocate more pages for ourself
+    // (aka do a memory allocation in Rust) it'll cause the buffer to change,
+    // causing the `Float32Array` to be invalid.
+    //
+    // As a result, after `Float32Array::view` we have to be very careful not to
+    // do any memory allocations before it's dropped.
+    unsafe {
+        let vert_array = js_sys::Float32Array::view(&mesh.vertices);
+
+        context.buffer_data_with_array_buffer_view(
+            WebGlRenderingContext::ARRAY_BUFFER,
+            &vert_array,
+            WebGlRenderingContext::STATIC_DRAW,
+        );
+    }
+
+    let index_buffer = context
+        .create_buffer()
+        .ok_or("failed to create index buffer")?;
+    context.bind_buffer(
+        WebGlRenderingContext::ELEMENT_ARRAY_BUFFER,
+        Some(&index_buffer),
+    );
+
+    unsafe {
+        let index_array = js_sys::Uint16Array::view(&mesh.indices);
+
+        context.buffer_data_with_array_buffer_view(
+            WebGlRenderingContext::ELEMENT_ARRAY_BUFFER,
+            &index_array,
+            WebGlRenderingContext::STATIC_DRAW,
+        );
+    }
+
+    Ok(GpuMesh {
+        vertex_buffer,
+        index_buffer,
+        num_indices: mesh.indices.len() as i32,
+    })
 }
