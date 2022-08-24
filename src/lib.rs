@@ -84,18 +84,24 @@ pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<(), JsValue> {
     }
 
     let mut model = Vec::new();
+    let mut camera = None;
     if let Some(scene) = document.default_scene() {
         for node in scene.nodes() {
             model.extend(load_scene_nodes(&node));
+            camera = load_scene_camera(&node);
         }
     }
 
-    Ok(display_model(&meshes, model)?)
+    Ok(display_model(&meshes, model, camera)?)
 }
 
 static QUIT_RENDERING: AtomicBool = AtomicBool::new(false);
 
-fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Result<(), JsValue> {
+fn display_model(
+    meshes: &[VertexMesh],
+    model: Vec<VertexMeshInstance>,
+    camera_opt: Option<Camera>,
+) -> Result<(), JsValue> {
     let document = web_sys::window().unwrap().document().unwrap();
     let canvas = document.get_element_by_id("canvas").unwrap();
     let canvas: web_sys::HtmlCanvasElement = canvas.dyn_into::<web_sys::HtmlCanvasElement>()?;
@@ -109,6 +115,7 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
         &context,
         WebGl2RenderingContext::VERTEX_SHADER,
         r#"
+        uniform mat4 projection;
         uniform mat4 view;
         uniform mat4 model;
         attribute vec3 position;
@@ -119,10 +126,10 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
         varying vec3 view_space_position;
 
         void main() {
-            vert_pos = position;
+            vert_pos = (model * vec4(position, 1.0)).xyz;
             vert_normal = aNormal;
             view_space_position = (view * model * vec4(position, 1.0)).xyz;
-            gl_Position = view * model * vec4(position, 1.0);
+            gl_Position = projection * view * model * vec4(position, 1.0);
         }
     "#,
     )?;
@@ -163,6 +170,9 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
     )?;
     let program = link_program(&context, &vert_shader, &frag_shader)?;
     context.use_program(Some(&program));
+    let projection_uniform = context
+        .get_uniform_location(&program, "projection")
+        .ok_or("Could not get projection uniform location")?;
     let transform_uniform = context
         .get_uniform_location(&program, "view")
         .ok_or("Could not get transform uniform location")?;
@@ -198,7 +208,17 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
         }
     }
 
-    let scale = 1.0 / furthest;
+    let camera = camera_opt.unwrap_or(Camera {
+        translation: glam::f32::vec3(0.0, 0.0, furthest),
+        rotation: glam::f32::vec4(0.0, 0.0, 0.0, 1.0),
+        aspect: 640.0 / 480.0,
+        fov: f32::to_radians(45.0),
+        near: 0.01,
+        far: 100.0,
+    });
+    let projection =
+        glam::f32::Mat4::perspective_infinite_rh(camera.fov, camera.aspect, camera.near);
+    log(&format!("camera = {:?}", camera));
 
     let f = Rc::new(RefCell::new(None));
     let g = f.clone();
@@ -214,7 +234,7 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
         }
 
         context.enable(WebGl2RenderingContext::CULL_FACE);
-        context.cull_face(WebGl2RenderingContext::FRONT);
+        context.cull_face(WebGl2RenderingContext::BACK);
 
         context.enable(WebGl2RenderingContext::DEPTH_TEST);
 
@@ -224,32 +244,29 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
         );
 
         let theta = (i as f32) / 60.0;
-        let tcos = theta.cos();
-        let tsin = theta.sin();
+        let radius = camera.translation.length();
+        let view_matrix = glam::f32::Mat4::look_at_rh(
+            glam::vec3(theta.sin() * radius, 0.0, theta.cos() * radius),
+            glam::vec3(0.0, 0.0, 0.0),
+            glam::vec3(0.0, 1.0, 0.0),
+        );
 
-        let view_matrix = mat4_mul(
-            // Scale down model to fit in viewport
-            [
-                scale, 0.0, 0.0, 0.0, //
-                0.0, scale, 0.0, 0.0, //
-                0.0, 0.0, scale, 0.0, //
-                0.0, 0.0, 0.0, 1.0, //
-            ],
-            // Rotate the model
-            [
-                tcos, 0.0, tsin, 0.0, //
-                0.0, 1.0, 0.0, 0.0, //
-                -tsin, 0.0, tcos, 0.0, //
-                0.0, 0.0, 0.0, 1.0, //
-            ],
+        context.use_program(Some(&program));
+        context.uniform_matrix4fv_with_f32_array(
+            Some(&projection_uniform),
+            false,
+            &projection.to_cols_array(),
+        );
+        context.uniform_matrix4fv_with_f32_array(
+            Some(&transform_uniform),
+            false,
+            &view_matrix.to_cols_array(),
         );
 
         for instance in &model {
             let gpu_mesh = &gpu_meshes[instance.index];
 
             // Render faces
-            context.use_program(Some(&program));
-            context.uniform_matrix4fv_with_f32_array(Some(&transform_uniform), false, &view_matrix);
             context.uniform_matrix4fv_with_f32_array(
                 Some(&model_transform_uniform),
                 false,
@@ -355,6 +372,15 @@ fn mat4_gltf_to_flat(gltf_matrix: [[f32; 4]; 4]) -> [f32; 4 * 4] {
     res
 }
 
+fn mat4_identity() -> [f32; 4 * 4] {
+    [
+        1.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, //
+        0.0, 0.0, 0.0, 1.0, //
+    ]
+}
+
 struct VertexMeshInstance {
     index: usize,
     transform: [f32; 4 * 4],
@@ -383,6 +409,53 @@ fn load_scene_nodes(gltf_node: &gltf::Node) -> Vec<VertexMeshInstance> {
     }
 
     nodes
+}
+
+#[derive(Debug)]
+struct Camera {
+    translation: glam::f32::Vec3,
+    rotation: glam::f32::Vec4,
+    aspect: f32,
+    fov: f32,
+    far: f32,
+    near: f32,
+}
+
+fn load_scene_camera(gltf_node: &gltf::Node) -> Option<Camera> {
+    let (v_translation, v_rotation, _) = gltf_node.transform().decomposed();
+    let translation = glam::f32::Vec3::from(v_translation);
+    let rotation = glam::f32::Vec4::from(v_rotation);
+
+    let mut camera = None;
+    for child in gltf_node.children() {
+        camera = load_scene_camera(&child);
+    }
+
+    if let Some(cam) = gltf_node.camera() {
+        match cam.projection() {
+            gltf::camera::Projection::Perspective(perspective) => {
+                camera = Some(Camera {
+                    translation: glam::f32::Vec3::ZERO,
+                    rotation: glam::f32::Vec4::new(0.0, 0.0, 0.0, 1.0),
+                    aspect: perspective.aspect_ratio().unwrap_or(640.0 / 480.0),
+                    fov: perspective.yfov(),
+                    far: perspective.zfar().unwrap_or(100.0),
+                    near: perspective.znear(),
+                });
+            }
+
+            _ => {}
+        }
+    }
+
+    camera.map(|c| Camera {
+        translation: translation + c.translation,
+        rotation: rotation * c.rotation,
+        aspect: c.aspect,
+        fov: c.fov,
+        far: c.far,
+        near: c.near,
+    })
 }
 
 struct VertexMesh {
