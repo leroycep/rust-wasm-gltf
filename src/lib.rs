@@ -6,10 +6,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{WebGlProgram, WebGlRenderingContext, WebGlShader};
+use web_sys::{WebGl2RenderingContext, WebGlProgram, WebGlShader};
 
 pub fn compile_shader(
-    context: &WebGlRenderingContext,
+    context: &WebGl2RenderingContext,
     shader_type: u32,
     source: &str,
 ) -> Result<WebGlShader, String> {
@@ -20,7 +20,7 @@ pub fn compile_shader(
     context.compile_shader(&shader);
 
     if context
-        .get_shader_parameter(&shader, WebGlRenderingContext::COMPILE_STATUS)
+        .get_shader_parameter(&shader, WebGl2RenderingContext::COMPILE_STATUS)
         .as_bool()
         .unwrap_or(false)
     {
@@ -33,7 +33,7 @@ pub fn compile_shader(
 }
 
 pub fn link_program(
-    context: &WebGlRenderingContext,
+    context: &WebGl2RenderingContext,
     vert_shader: &WebGlShader,
     frag_shader: &WebGlShader,
 ) -> Result<WebGlProgram, String> {
@@ -46,7 +46,7 @@ pub fn link_program(
     context.link_program(&program);
 
     if context
-        .get_program_parameter(&program, WebGlRenderingContext::LINK_STATUS)
+        .get_program_parameter(&program, WebGl2RenderingContext::LINK_STATUS)
         .as_bool()
         .unwrap_or(false)
     {
@@ -94,13 +94,13 @@ fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
     let canvas: web_sys::HtmlCanvasElement = canvas.dyn_into::<web_sys::HtmlCanvasElement>()?;
 
     let context = canvas
-        .get_context("webgl")?
+        .get_context("webgl2")?
         .unwrap()
-        .dyn_into::<WebGlRenderingContext>()?;
+        .dyn_into::<WebGl2RenderingContext>()?;
 
     let vert_shader = compile_shader(
         &context,
-        WebGlRenderingContext::VERTEX_SHADER,
+        WebGl2RenderingContext::VERTEX_SHADER,
         r#"
         uniform mat4 transform;
         attribute vec3 position;
@@ -108,35 +108,48 @@ fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
 
         varying vec3 vert_pos;
         varying vec3 vert_normal;
+        varying vec3 view_space_position;
 
         void main() {
             vert_pos = position;
             vert_normal = aNormal;
+            view_space_position = (transform * vec4(position, 1.0)).xyz;
             gl_Position = transform * vec4(position, 1.0);
         }
     "#,
     )?;
     let frag_shader = compile_shader(
         &context,
-        WebGlRenderingContext::FRAGMENT_SHADER,
+        WebGl2RenderingContext::FRAGMENT_SHADER,
         r#"
-        varying mediump vec3 vert_pos;
-        varying mediump vec3 vert_normal;
+        #ifdef GL_ES
+        precision mediump float;
+        #endif
+        varying vec3 vert_pos;
+        varying vec3 vert_normal;
+        varying vec3 view_space_position;
 
-        const mediump float ambient_strength = 0.1;
-        const mediump vec3 light_color = vec3(0.8, 0.8, 0.8);
-        const mediump vec3 object_color = vec3(136.0 / 255.0);
-        const mediump float alpha = 1.0;
-        const mediump vec3 light_pos = vec3(-100.0, 100.0, 0.0);
+        const float ambient_strength = 0.1;
+        const float specular_strength = 0.5;
+        const vec3 light_color = vec3(0.8, 0.8, 0.8);
+        const vec3 object_color = vec3(136.0 / 255.0);
+        const float alpha = 1.0;
+        const vec3 light_pos = vec3(-100.0, 100.0, 0.0);
 
         void main() {
-            mediump vec3 ambient = ambient_strength * light_color;
+            vec3 normal = normalize(vert_normal);
+            vec3 ambient = ambient_strength * light_color;
         
-            mediump vec3 light_dir = normalize(light_pos - vert_pos);
-            mediump float diffuse_strength = max(dot(normalize(vert_normal), light_dir), 0.0);
-            mediump vec3 diffuse = diffuse_strength * light_color;
+            vec3 light_dir = normalize(light_pos - vert_pos);
+            float diffuse_strength = max(dot(normal, light_dir), 0.0);
+            vec3 diffuse = diffuse_strength * light_color;
+
+            vec3 view_dir = normalize(view_space_position);
+            vec3 reflect_vec = reflect(-light_dir, normal);
+            float specular_intensity = pow(max(dot(reflect_vec, view_dir), 0.0), 32.0);
+            vec3 specular = specular_strength * specular_intensity * light_color;
         
-            gl_FragColor = vec4((ambient + diffuse) * object_color, alpha);
+            gl_FragColor = vec4((ambient + diffuse + specular) * object_color, alpha);
         }
     "#,
     )?;
@@ -148,7 +161,7 @@ fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
 
     let line_frag_shader = compile_shader(
         &context,
-        WebGlRenderingContext::FRAGMENT_SHADER,
+        WebGl2RenderingContext::FRAGMENT_SHADER,
         r#"
         void main() {
             gl_FragColor = vec4(0.0, 0.0, 0.4, 0.0);
@@ -189,14 +202,14 @@ fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
             return;
         }
 
-        context.enable(WebGlRenderingContext::CULL_FACE);
-        context.cull_face(WebGlRenderingContext::FRONT);
+        context.enable(WebGl2RenderingContext::CULL_FACE);
+        context.cull_face(WebGl2RenderingContext::FRONT);
 
-        context.enable(WebGlRenderingContext::DEPTH_TEST);
+        context.enable(WebGl2RenderingContext::DEPTH_TEST);
 
         context.clear_color(0.0, 0.0, 0.0, 1.0);
         context.clear(
-            WebGlRenderingContext::COLOR_BUFFER_BIT | WebGlRenderingContext::DEPTH_BUFFER_BIT,
+            WebGl2RenderingContext::COLOR_BUFFER_BIT | WebGl2RenderingContext::DEPTH_BUFFER_BIT,
         );
 
         let theta = (i as f32) / 60.0;
@@ -225,11 +238,11 @@ fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
             context.use_program(Some(&program));
             context.uniform_matrix4fv_with_f32_array(Some(&transform_uniform), false, &transform);
             context.bind_buffer(
-                WebGlRenderingContext::ARRAY_BUFFER,
+                WebGl2RenderingContext::ARRAY_BUFFER,
                 Some(&gpu_mesh.vertex_buffer),
             );
             context.bind_buffer(
-                WebGlRenderingContext::ELEMENT_ARRAY_BUFFER,
+                WebGl2RenderingContext::ELEMENT_ARRAY_BUFFER,
                 Some(&gpu_mesh.index_buffer),
             );
 
@@ -239,7 +252,7 @@ fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
             context.vertex_attrib_pointer_with_i32(
                 position_attribute as u32,
                 3,
-                WebGlRenderingContext::FLOAT,
+                WebGl2RenderingContext::FLOAT,
                 false,
                 (6 * size_of::<f32>()) as i32,
                 0,
@@ -248,7 +261,7 @@ fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
             context.vertex_attrib_pointer_with_i32(
                 normal_attribute as u32,
                 3,
-                WebGlRenderingContext::FLOAT,
+                WebGl2RenderingContext::FLOAT,
                 false,
                 (6 * size_of::<f32>()) as i32,
                 (3 * size_of::<f32>()) as i32,
@@ -256,9 +269,9 @@ fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
             context.enable_vertex_attrib_array(normal_attribute as u32);
 
             context.draw_elements_with_i32(
-                WebGlRenderingContext::TRIANGLES,
+                WebGl2RenderingContext::TRIANGLES,
                 gpu_mesh.num_indices,
-                WebGlRenderingContext::UNSIGNED_SHORT,
+                WebGl2RenderingContext::UNSIGNED_SHORT,
                 0,
             );
         }
@@ -388,11 +401,11 @@ struct GpuMesh {
 }
 
 fn upload_mesh_to_gpu(
-    context: &WebGlRenderingContext,
+    context: &WebGl2RenderingContext,
     mesh: &VertexMesh,
 ) -> Result<GpuMesh, JsValue> {
     let vertex_buffer = context.create_buffer().ok_or("failed to create buffer")?;
-    context.bind_buffer(WebGlRenderingContext::ARRAY_BUFFER, Some(&vertex_buffer));
+    context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&vertex_buffer));
 
     // Note that `Float32Array::view` is somewhat dangerous (hence the
     // `unsafe`!). This is creating a raw view into our module's
@@ -406,9 +419,9 @@ fn upload_mesh_to_gpu(
         let vert_array = js_sys::Float32Array::view(&mesh.vertices);
 
         context.buffer_data_with_array_buffer_view(
-            WebGlRenderingContext::ARRAY_BUFFER,
+            WebGl2RenderingContext::ARRAY_BUFFER,
             &vert_array,
-            WebGlRenderingContext::STATIC_DRAW,
+            WebGl2RenderingContext::STATIC_DRAW,
         );
     }
 
@@ -416,7 +429,7 @@ fn upload_mesh_to_gpu(
         .create_buffer()
         .ok_or("failed to create index buffer")?;
     context.bind_buffer(
-        WebGlRenderingContext::ELEMENT_ARRAY_BUFFER,
+        WebGl2RenderingContext::ELEMENT_ARRAY_BUFFER,
         Some(&index_buffer),
     );
 
@@ -424,9 +437,9 @@ fn upload_mesh_to_gpu(
         let index_array = js_sys::Uint16Array::view(&mesh.indices);
 
         context.buffer_data_with_array_buffer_view(
-            WebGlRenderingContext::ELEMENT_ARRAY_BUFFER,
+            WebGl2RenderingContext::ELEMENT_ARRAY_BUFFER,
             &index_array,
-            WebGlRenderingContext::STATIC_DRAW,
+            WebGl2RenderingContext::STATIC_DRAW,
         );
     }
 
