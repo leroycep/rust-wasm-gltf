@@ -13,11 +13,7 @@ module.exports = {
         rules: [
             {
                 test: /\.(glb)$/i,
-                loader: 'file-loader',
-                options: {
-                    publicPath: './',
-                    name: '[name].[ext]',
-                }
+                type: "asset/resource",
             }
         ]
     },
