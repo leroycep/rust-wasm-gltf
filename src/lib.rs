@@ -83,12 +83,19 @@ pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<(), JsValue> {
         ));
     }
 
-    Ok(display_model(&meshes)?)
+    let mut model = Vec::new();
+    if let Some(scene) = document.default_scene() {
+        for node in scene.nodes() {
+            model.extend(load_scene_nodes(&node));
+        }
+    }
+
+    Ok(display_model(&meshes, model)?)
 }
 
 static QUIT_RENDERING: AtomicBool = AtomicBool::new(false);
 
-fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
+fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Result<(), JsValue> {
     let document = web_sys::window().unwrap().document().unwrap();
     let canvas = document.get_element_by_id("canvas").unwrap();
     let canvas: web_sys::HtmlCanvasElement = canvas.dyn_into::<web_sys::HtmlCanvasElement>()?;
@@ -102,7 +109,8 @@ fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
         &context,
         WebGl2RenderingContext::VERTEX_SHADER,
         r#"
-        uniform mat4 transform;
+        uniform mat4 view;
+        uniform mat4 model;
         attribute vec3 position;
         attribute vec3 aNormal;
 
@@ -113,8 +121,8 @@ fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
         void main() {
             vert_pos = position;
             vert_normal = aNormal;
-            view_space_position = (transform * vec4(position, 1.0)).xyz;
-            gl_Position = transform * vec4(position, 1.0);
+            view_space_position = (view * model * vec4(position, 1.0)).xyz;
+            gl_Position = view * model * vec4(position, 1.0);
         }
     "#,
     )?;
@@ -156,8 +164,11 @@ fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
     let program = link_program(&context, &vert_shader, &frag_shader)?;
     context.use_program(Some(&program));
     let transform_uniform = context
-        .get_uniform_location(&program, "transform")
-        .ok_or_else(|| JsValue::from_str("Could not get transform uniform location"))?;
+        .get_uniform_location(&program, "view")
+        .ok_or("Could not get transform uniform location")?;
+    let model_transform_uniform = context
+        .get_uniform_location(&program, "model")
+        .ok_or("Could not get transform uniform location")?;
 
     let line_frag_shader = compile_shader(
         &context,
@@ -170,7 +181,7 @@ fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
     )?;
     let line_program = link_program(&context, &vert_shader, &line_frag_shader)?;
     let line_transform_uniform = context
-        .get_uniform_location(&line_program, "transform")
+        .get_uniform_location(&line_program, "view")
         .ok_or_else(|| JsValue::from_str("Could not get transform uniform location"))?;
 
     let mut furthest: f32 = 0.01;
@@ -216,7 +227,7 @@ fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
         let tcos = theta.cos();
         let tsin = theta.sin();
 
-        let transform = mat4_mul(
+        let view_matrix = mat4_mul(
             // Scale down model to fit in viewport
             [
                 scale, 0.0, 0.0, 0.0, //
@@ -233,10 +244,17 @@ fn display_model(meshes: &[VertexMesh]) -> Result<(), JsValue> {
             ],
         );
 
-        for gpu_mesh in &gpu_meshes {
+        for instance in &model {
+            let gpu_mesh = &gpu_meshes[instance.index];
+
             // Render faces
             context.use_program(Some(&program));
-            context.uniform_matrix4fv_with_f32_array(Some(&transform_uniform), false, &transform);
+            context.uniform_matrix4fv_with_f32_array(Some(&transform_uniform), false, &view_matrix);
+            context.uniform_matrix4fv_with_f32_array(
+                Some(&model_transform_uniform),
+                false,
+                &instance.transform,
+            );
             context.bind_buffer(
                 WebGl2RenderingContext::ARRAY_BUFFER,
                 Some(&gpu_mesh.vertex_buffer),
@@ -324,6 +342,47 @@ fn mat4_mul(left: [f32; 4 * 4], right: [f32; 4 * 4]) -> [f32; 4 * 4] {
         }
     }
     res
+}
+
+fn mat4_gltf_to_flat(gltf_matrix: [[f32; 4]; 4]) -> [f32; 4 * 4] {
+    let mut res = [0.0; 4 * 4];
+    for i in 0..4 {
+        for j in 0..4 {
+            let res_index = j * 4 + i;
+            res[res_index] = gltf_matrix[j][i];
+        }
+    }
+    res
+}
+
+struct VertexMeshInstance {
+    index: usize,
+    transform: [f32; 4 * 4],
+}
+
+fn load_scene_nodes(gltf_node: &gltf::Node) -> Vec<VertexMeshInstance> {
+    log(&format!("Node name = {:?}", gltf_node.name()));
+    if let Some(_cam) = gltf_node.camera() {
+        log("Node has a camera! Ignored, as cameras are not yet implemented");
+    }
+
+    let transform = mat4_gltf_to_flat(gltf_node.transform().matrix());
+    let mut nodes = Vec::new();
+    for child in gltf_node.children() {
+        nodes.extend(load_scene_nodes(&child));
+    }
+
+    for node in &mut nodes {
+        node.transform = mat4_mul(transform, node.transform);
+    }
+
+    if let Some(mesh) = gltf_node.mesh() {
+        let index = mesh.index();
+
+        nodes.push(VertexMeshInstance { index, transform });
+    }
+
+    nodes
 }
 
 struct VertexMesh {
