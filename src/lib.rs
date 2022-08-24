@@ -1,5 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{WebGlProgram, WebGlRenderingContext, WebGlShader};
@@ -56,14 +58,22 @@ pub fn link_program(
 
 #[wasm_bindgen]
 pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<(), JsValue> {
+    log(&format!(
+        "load_gltf_model loading {} bytes",
+        gltf_bytes.len()
+    ));
+
     let (document, buffers, _images) =
         gltf::import_slice(&gltf_bytes).map_err(|err| format!("error parsing gltf: {}", err))?;
 
     let mut bounds = [[0f32; 3]; 2];
     let mut vertices = Vec::<f32>::new();
+    let mut normals = Vec::<f32>::new();
     let mut indices = Vec::<u16>::new();
 
     for mesh in document.meshes() {
+        log(&format!("reading mesh; name = {:?}", mesh.name()));
+
         for prim in mesh.primitives() {
             log(&format!(
                 "\tprimitive = {:?}; bounds = {:?}",
@@ -85,6 +95,13 @@ pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<(), JsValue> {
                 bounds[1][1] = bounds[1][1].max(pos[1]);
                 bounds[1][2] = bounds[1][2].max(pos[2]);
             }
+            if let Some(normal_reader) = reader.read_normals() {
+                for normal in normal_reader {
+                    vertices.push(normal[0]);
+                    vertices.push(normal[1]);
+                    vertices.push(normal[2]);
+                }
+            }
             for index in reader.read_indices().unwrap().into_u32() {
                 indices.push(index as u16);
             }
@@ -98,10 +115,10 @@ pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<(), JsValue> {
         bounds,
     ));
 
-    display_model(bounds, &vertices, &indices)?;
-
-    Ok(())
+    Ok(display_model(bounds, &vertices, &indices)?)
 }
+
+static QUIT_RENDERING: AtomicBool = AtomicBool::new(false);
 
 pub fn display_model(
     bounds: [[f32; 3]; 2],
@@ -123,8 +140,12 @@ pub fn display_model(
         r#"
         uniform mat4 transform;
         attribute vec3 position;
+        
+        varying vec3 vert_pos;
+        
         void main() {
-            gl_Position = transform * vec4(position, 1.0);
+            vert_pos = (transform * vec4(position, 1.0)).xyz;
+            gl_Position = vec4(vert_pos, 1.0);
         }
     "#,
     )?;
@@ -132,8 +153,15 @@ pub fn display_model(
         &context,
         WebGlRenderingContext::FRAGMENT_SHADER,
         r#"
+        const mediump float ambient_strength = 0.1;
+        const mediump vec3 light_color = vec3(0.8, 0.8, 0.8);
+        const mediump vec3 object_color = vec3(136.0 / 255.0);
+        const mediump float alpha = 1.0;
+
         void main() {
-            gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);
+            mediump vec3 ambient = ambient_strength * light_color;
+        
+            gl_FragColor = vec4(ambient * object_color, alpha);
         }
     "#,
     )?;
@@ -188,11 +216,27 @@ pub fn display_model(
 
     let num_indices = (indices.len()) as i32;
 
+    let mut furthest = bounds[0][0];
+    for pos in bounds {
+        for coord in pos {
+            furthest = furthest.max(coord);
+        }
+    }
+    let scale = 1.0 / furthest;
+
     let f = Rc::new(RefCell::new(None));
     let g = f.clone();
 
+    QUIT_RENDERING.store(false, Ordering::SeqCst);
     let mut i: u64 = 0;
     *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
+        if QUIT_RENDERING.load(Ordering::SeqCst) {
+            log(&format!("Stopping rendering"));
+
+            let _ = f.borrow_mut().take();
+            return;
+        }
+
         context.clear_color(0.0, 0.0, 0.0, 1.0);
         context.clear(WebGlRenderingContext::COLOR_BUFFER_BIT);
 
@@ -203,9 +247,9 @@ pub fn display_model(
         let transform = mat4_mul(
             // Scale down model to fit in viewport
             [
-                0.01, 0.0, 0.0, 0.0, //
-                0.0, 0.01, 0.0, 0.0, //
-                0.0, 0.0, 0.01, 0.0, //
+                scale, 0.0, 0.0, 0.0, //
+                0.0, scale, 0.0, 0.0, //
+                0.0, 0.0, scale, 0.0, //
                 0.0, 0.0, 0.0, 1.0, //
             ],
             // Rotate the model
@@ -227,11 +271,19 @@ pub fn display_model(
         );
 
         i += 1;
+
         request_animation_frame(f.borrow().as_ref().unwrap());
     }) as Box<dyn FnMut()>));
 
     request_animation_frame(g.borrow().as_ref().unwrap());
     Ok(())
+}
+
+#[wasm_bindgen]
+pub fn quit_rendering() {
+    log(&format!("Setting QUIT_RENDERING to true"));
+
+    QUIT_RENDERING.store(true, Ordering::SeqCst);
 }
 
 fn window() -> web_sys::Window {
