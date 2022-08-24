@@ -37,7 +37,7 @@ import('./pkg')
       console.log(resp);
       const gltf_bytes = await resp.arrayBuffer();
       console.log(gltf_bytes);
-      quit_prev_renderer = m.load_gltf_model(new Uint8Array(gltf_bytes));
+      m.load_gltf_model(new Uint8Array(gltf_bytes));
     })
   })
   .catch(console.error);

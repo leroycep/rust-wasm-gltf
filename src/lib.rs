@@ -118,12 +118,10 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
 
         varying vec3 vert_pos;
         varying vec3 vert_normal;
-        varying vec3 view_space_position;
 
         void main() {
             vert_pos = (model * vec4(position, 1.0)).xyz;
             vert_normal = aNormal;
-            view_space_position = (view * model * vec4(position, 1.0)).xyz;
             gl_Position = projection * view * model * vec4(position, 1.0);
         }
     "#,
@@ -135,6 +133,9 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
         #ifdef GL_ES
         precision mediump float;
         #endif
+        uniform vec3 light_pos;
+        uniform vec3 view_pos;
+
         varying vec3 vert_pos;
         varying vec3 vert_normal;
         varying vec3 view_space_position;
@@ -143,8 +144,6 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
         const float specular_strength = 0.5;
         const vec3 light_color = vec3(1.0);
         const vec3 object_color = vec3(136.0 / 255.0);
-        const float alpha = 1.0;
-        const vec3 light_pos = vec3(-100.0, 100.0, 0.0);
 
         void main() {
             vec3 normal = normalize(vert_normal);
@@ -154,12 +153,12 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
             float diffuse_strength = max(dot(normal, light_dir), 0.0);
             vec3 diffuse = diffuse_strength * light_color;
 
-            vec3 view_dir = normalize(view_space_position);
-            vec3 reflect_vec = reflect(-light_dir, normal);
-            float specular_intensity = pow(max(dot(reflect_vec, view_dir), 0.0), 32.0);
+            vec3 view_dir = normalize(view_pos - vert_pos);
+            vec3 reflect_dir = reflect(-light_dir, normal);
+            float specular_intensity = pow(max(dot(view_dir, reflect_dir), 0.0), 32.0);
             vec3 specular = specular_strength * specular_intensity * light_color;
         
-            gl_FragColor = vec4((ambient + diffuse + specular) * object_color, alpha);
+            gl_FragColor = vec4((ambient + diffuse + specular) * object_color, 1.0);
         }
     "#,
     )?;
@@ -174,6 +173,12 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
     let model_transform_uniform = context
         .get_uniform_location(&program, "model")
         .ok_or("Could not get transform uniform location")?;
+    let light_pos_uniform = context
+        .get_uniform_location(&program, "light_pos")
+        .ok_or("Could not get light_pos uniform location")?;
+    let view_pos_uniform = context
+        .get_uniform_location(&program, "view_pos")
+        .ok_or("Could not get view_pos uniform location")?;
 
     let line_frag_shader = compile_shader(
         &context,
@@ -220,6 +225,8 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
     let projection =
         glam::f32::Mat4::perspective_infinite_rh(f32::to_radians(45.0), 640.0 / 480.0, 0.01);
 
+    let light_pos = glam::vec3(1000.0, 1000.0, 1000.0);
+
     let f = Rc::new(RefCell::new(None));
     let g = f.clone();
 
@@ -245,12 +252,15 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
 
         let theta = (i as f32) / 60.0;
         let radius = 1.5;
+        let camera_pos = glam::vec3(theta.sin() * radius, 0.5, theta.cos() * radius);
+
         let view_matrix = glam::f32::Mat4::look_at_rh(
-            glam::vec3(theta.sin() * radius, 0.5, theta.cos() * radius),
+            camera_pos,
             glam::vec3(0.0, 0.0, 0.0),
             glam::vec3(0.0, 1.0, 0.0),
         );
 
+        // Render faces
         context.use_program(Some(&program));
         context.uniform_matrix4fv_with_f32_array(
             Some(&projection_uniform),
@@ -262,18 +272,19 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
             false,
             &view_matrix.to_cols_array(),
         );
+        context.uniform3fv_with_f32_array(Some(&light_pos_uniform), &light_pos.to_array());
+        context.uniform3fv_with_f32_array(Some(&view_pos_uniform), &camera_pos.to_array());
 
         for instance in &model {
             let gpu_mesh = &gpu_meshes[instance.index];
 
             let model_transform = model_scale * model_offset * instance.transform;
-
-            // Render faces
             context.uniform_matrix4fv_with_f32_array(
                 Some(&model_transform_uniform),
                 false,
                 &model_transform.to_cols_array(),
             );
+
             context.bind_buffer(
                 WebGl2RenderingContext::ARRAY_BUFFER,
                 Some(&gpu_mesh.vertex_buffer),
@@ -441,8 +452,8 @@ fn load_mesh(gltf_mesh: &Mesh, buffers: &[gltf::buffer::Data]) -> VertexMesh {
                     glam::Vec3::from_slice(&vertices[(6 * triangle_indices[1]) as usize..][0..3]),
                     glam::Vec3::from_slice(&vertices[(6 * triangle_indices[2]) as usize..][0..3]),
                 ];
-                let face_normal = (triangle_pos[2] - triangle_pos[0])
-                    .cross(triangle_pos[1] - triangle_pos[0])
+                let face_normal = (triangle_pos[0] - triangle_pos[1])
+                    .cross(triangle_pos[1] - triangle_pos[2])
                     .to_array();
                 for index in triangle_indices {
                     let offset = (6 * index) as usize;
