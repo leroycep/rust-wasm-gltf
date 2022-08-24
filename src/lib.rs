@@ -98,7 +98,9 @@ pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<(), JsValue> {
 static QUIT_RENDERING: AtomicBool = AtomicBool::new(false);
 
 fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Result<(), JsValue> {
-    let document = web_sys::window().unwrap().document().unwrap();
+    let window = web_sys::window().unwrap();
+    let performance = window.performance().unwrap();
+    let document = window.document().unwrap();
     let canvas = document.get_element_by_id("canvas").unwrap();
     let canvas: web_sys::HtmlCanvasElement = canvas.dyn_into::<web_sys::HtmlCanvasElement>()?;
 
@@ -266,6 +268,7 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
 
     QUIT_RENDERING.store(false, Ordering::SeqCst);
     let mut i: u64 = 0;
+    let start_time = (performance.now() / 1000.0) as f32;
     *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
         if QUIT_RENDERING.load(Ordering::SeqCst) {
             log(&format!("Stopping rendering"));
@@ -273,6 +276,9 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
             let _ = f.borrow_mut().take();
             return;
         }
+
+        let current_time = (performance.now() / 1000.0) as f32;
+        let time = current_time - start_time;
 
         context.enable(WebGl2RenderingContext::CULL_FACE);
         context.cull_face(WebGl2RenderingContext::BACK);
@@ -284,7 +290,7 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
             WebGl2RenderingContext::COLOR_BUFFER_BIT | WebGl2RenderingContext::DEPTH_BUFFER_BIT,
         );
 
-        let theta = (i as f32) / 60.0;
+        let theta = time * (2.0 * std::f32::consts::PI) / 5.0;
         let radius = 1.5;
         let camera_pos = glam::vec3(theta.sin() * radius, 0.5, theta.cos() * radius);
 
