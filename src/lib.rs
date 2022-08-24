@@ -1,5 +1,6 @@
 use gltf::Mesh;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::mem::size_of;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
@@ -138,7 +139,6 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
 
         varying vec3 vert_pos;
         varying vec3 vert_normal;
-        varying vec3 view_space_position;
 
         const float ambient_strength = 0.4;
         const float specular_strength = 0.5;
@@ -180,24 +180,58 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
         .get_uniform_location(&program, "view_pos")
         .ok_or("Could not get view_pos uniform location")?;
 
+    let line_vert_shader = compile_shader(
+        &context,
+        WebGl2RenderingContext::VERTEX_SHADER,
+        r#"
+        uniform mat4 projection;
+        uniform mat4 view;
+        uniform mat4 model;
+
+        attribute vec3 position;
+        attribute vec3 aNormal;
+
+        void main() {
+            vec3 model_pos = (model * vec4(position, 1.0)).xyz;
+            vec3 offset_vec = normalize((model * vec4(aNormal, 0.0)).xyz);
+            vec3 offset_pos = model_pos + offset_vec * 0.0001;
+            gl_Position = projection * view * vec4(offset_pos, 1.0);
+        }
+    "#,
+    )?;
     let line_frag_shader = compile_shader(
         &context,
         WebGl2RenderingContext::FRAGMENT_SHADER,
         r#"
+        #ifdef GL_ES
+        precision mediump float;
+        #endif
+
         void main() {
-            gl_FragColor = vec4(0.0, 0.0, 0.4, 0.0);
+            gl_FragColor = vec4(0.0, 0.0, 0.8, 0.0);
         }
     "#,
     )?;
-    let line_program = link_program(&context, &vert_shader, &line_frag_shader)?;
-    let line_transform_uniform = context
+    let line_program = link_program(&context, &line_vert_shader, &line_frag_shader)?;
+    let line_projection_uniform = context
+        .get_uniform_location(&line_program, "projection")
+        .ok_or_else(|| JsValue::from_str("Could not get projection uniform location"))?;
+    let line_view_uniform = context
         .get_uniform_location(&line_program, "view")
-        .ok_or_else(|| JsValue::from_str("Could not get transform uniform location"))?;
+        .ok_or_else(|| JsValue::from_str("Could not get view uniform location"))?;
+    let line_model_uniform = context
+        .get_uniform_location(&line_program, "model")
+        .ok_or_else(|| JsValue::from_str("Could not get model uniform location"))?;
 
     let mut gpu_meshes = Vec::new();
+    let mut line_gpu_meshes = Vec::new();
     // Upload meshes
     for mesh in meshes {
         gpu_meshes.push(upload_mesh_to_gpu(&context, mesh)?);
+        line_gpu_meshes.push(upload_mesh_to_gpu(
+            &context,
+            &line_mesh_from_triangle_mesh(mesh),
+        )?);
     }
 
     let mut min = glam::vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
@@ -319,6 +353,67 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
             context.draw_elements_with_i32(
                 WebGl2RenderingContext::TRIANGLES,
                 gpu_mesh.num_indices,
+                WebGl2RenderingContext::UNSIGNED_SHORT,
+                0,
+            );
+        }
+
+        // Render lines
+        context.use_program(Some(&line_program));
+        context.uniform_matrix4fv_with_f32_array(
+            Some(&line_projection_uniform),
+            false,
+            &projection.to_cols_array(),
+        );
+        context.uniform_matrix4fv_with_f32_array(
+            Some(&line_view_uniform),
+            false,
+            &view_matrix.to_cols_array(),
+        );
+        for instance in &model {
+            let line_mesh = &line_gpu_meshes[instance.index];
+
+            let model_transform = model_scale * model_offset * instance.transform;
+            context.uniform_matrix4fv_with_f32_array(
+                Some(&line_model_uniform),
+                false,
+                &model_transform.to_cols_array(),
+            );
+
+            context.bind_buffer(
+                WebGl2RenderingContext::ARRAY_BUFFER,
+                Some(&line_mesh.vertex_buffer),
+            );
+            context.bind_buffer(
+                WebGl2RenderingContext::ELEMENT_ARRAY_BUFFER,
+                Some(&line_mesh.index_buffer),
+            );
+
+            let position_attribute = context.get_attrib_location(&line_program, "position");
+            let normal_attribute = context.get_attrib_location(&line_program, "aNormal");
+
+            context.vertex_attrib_pointer_with_i32(
+                position_attribute as u32,
+                3,
+                WebGl2RenderingContext::FLOAT,
+                false,
+                (6 * size_of::<f32>()) as i32,
+                0,
+            );
+            context.enable_vertex_attrib_array(position_attribute as u32);
+            context.vertex_attrib_pointer_with_i32(
+                normal_attribute as u32,
+                3,
+                WebGl2RenderingContext::FLOAT,
+                false,
+                (6 * size_of::<f32>()) as i32,
+                (3 * size_of::<f32>()) as i32,
+            );
+            context.enable_vertex_attrib_array(normal_attribute as u32);
+
+            context.draw_elements_with_i32(
+                WebGl2RenderingContext::LINES,
+                line_mesh.num_indices,
                 WebGl2RenderingContext::UNSIGNED_SHORT,
                 0,
             );
@@ -478,6 +573,36 @@ fn load_mesh(gltf_mesh: &Mesh, buffers: &[gltf::buffer::Data]) -> VertexMesh {
         min,
         max,
         vertices,
+        indices,
+    }
+}
+
+fn line_mesh_from_triangle_mesh(mesh: &VertexMesh) -> VertexMesh {
+    let mut lines = HashSet::new();
+
+    for i in 0..mesh.indices.len() / 3 {
+        let a = mesh.indices[i * 3];
+        let b = mesh.indices[i * 3 + 1];
+        let c = mesh.indices[i * 3 + 2];
+
+        let line_ab = (a.min(b), a.max(b));
+        let line_bc = (b.min(c), b.max(c));
+        let line_ca = (c.min(a), c.max(a));
+        lines.insert(line_ab);
+        lines.insert(line_bc);
+        lines.insert(line_ca);
+    }
+
+    let mut indices = Vec::<u16>::new();
+    for line in lines {
+        indices.push(line.0);
+        indices.push(line.1);
+    }
+
+    VertexMesh {
+        min: mesh.min,
+        max: mesh.max,
+        vertices: mesh.vertices.clone(),
         indices,
     }
 }
