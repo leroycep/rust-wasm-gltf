@@ -85,11 +85,16 @@ pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<(), JsValue> {
         ));
     }
 
-    let mut model = Vec::new();
+    let mut model = std::collections::BTreeMap::new();
     if let Some(scene) = document.default_scene() {
         for node in scene.nodes() {
             model.extend(load_scene_nodes(&node));
         }
+    }
+
+    let mut animations = Vec::new();
+    for animation in document.animations() {
+        animations.push(load_animation(&animation, &buffers));
     }
 
     Ok(display_model(&meshes, model)?)
@@ -97,7 +102,10 @@ pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<(), JsValue> {
 
 static QUIT_RENDERING: AtomicBool = AtomicBool::new(false);
 
-fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Result<(), JsValue> {
+fn display_model(
+    meshes: &[VertexMesh],
+    model: std::collections::BTreeMap<usize, VertexMeshInstance>,
+) -> Result<(), JsValue> {
     let window = web_sys::window().unwrap();
     let performance = window.performance().unwrap();
     let document = window.document().unwrap();
@@ -238,17 +246,17 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
 
     let mut min = glam::vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
     let mut max = glam::vec3(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for mesh_instance in &model {
+    for (_node_index, mesh_instance) in &model {
         log(&format!("transform = {}", mesh_instance.transform));
         min = min.min(
             mesh_instance
                 .transform
-                .transform_point3(meshes[mesh_instance.index].min),
+                .transform_point3(meshes[mesh_instance.mesh_index].min),
         );
         max = max.max(
             mesh_instance
                 .transform
-                .transform_point3(meshes[mesh_instance.index].max),
+                .transform_point3(meshes[mesh_instance.mesh_index].max),
         );
     }
     let size = (max - min).max_element();
@@ -315,8 +323,8 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
         context.uniform3fv_with_f32_array(Some(&light_pos_uniform), &light_pos.to_array());
         context.uniform3fv_with_f32_array(Some(&view_pos_uniform), &camera_pos.to_array());
 
-        for instance in &model {
-            let gpu_mesh = &gpu_meshes[instance.index];
+        for (_node_index, instance) in &model {
+            let gpu_mesh = &gpu_meshes[instance.mesh_index];
 
             let model_transform = model_scale * model_offset * instance.transform;
             context.uniform_matrix4fv_with_f32_array(
@@ -376,8 +384,8 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
             false,
             &view_matrix.to_cols_array(),
         );
-        for instance in &model {
-            let line_mesh = &line_gpu_meshes[instance.index];
+        for (_node_index, instance) in &model {
+            let line_mesh = &line_gpu_meshes[instance.mesh_index];
 
             let model_transform = model_scale * model_offset * instance.transform;
             context.uniform_matrix4fv_with_f32_array(
@@ -425,7 +433,8 @@ fn display_model(meshes: &[VertexMesh], model: Vec<VertexMeshInstance>) -> Resul
             );
         }
 
-        i += 1;
+        let i = &mut i;
+        *i += 1;
 
         request_animation_frame(f.borrow().as_ref().unwrap());
     }) as Box<dyn FnMut()>));
@@ -460,12 +469,97 @@ extern "C" {
 
 }
 
+struct Animation {
+    name: Option<String>,
+    node_values: std::collections::BTreeMap<usize, NodeAnimationValues>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NodeAnimationValues {
+    translations_timeline: Vec<f32>,
+    translations: Vec<glam::Vec3>,
+
+    rotations_timeline: Vec<f32>,
+    rotations: Vec<glam::Quat>,
+
+    scales_timeline: Vec<f32>,
+    scales: Vec<glam::Vec3>,
+}
+
+fn load_animation(gltf_animation: &gltf::Animation, buffers: &[gltf::buffer::Data]) -> Animation {
+    log(&format!("animation name = {:?}", gltf_animation.name()));
+    let mut node_animation_values: std::collections::BTreeMap<usize, NodeAnimationValues> =
+        std::collections::BTreeMap::new();
+    for channel in gltf_animation.channels() {
+        let reader = channel.reader(|buffer| Some(&buffers[buffer.index()]));
+
+        let mut inputs = Vec::new();
+        for input in reader.read_inputs().unwrap() {
+            inputs.push(input);
+        }
+
+        match reader.read_outputs() {
+            Some(gltf::animation::util::ReadOutputs::Translations(translations)) => {
+                let mut outputs = Vec::new();
+                for translation in translations {
+                    outputs.push(glam::Vec3::from_array(translation));
+                }
+
+                let values = node_animation_values
+                    .entry(channel.target().node().index())
+                    .or_default();
+                values.translations_timeline = inputs;
+                values.translations = outputs;
+            }
+            Some(gltf::animation::util::ReadOutputs::Rotations(rotations)) => {
+                let mut outputs = Vec::new();
+                for rotation in rotations.into_f32() {
+                    outputs.push(glam::Quat::from_array(rotation));
+                }
+
+                let values = node_animation_values
+                    .entry(channel.target().node().index())
+                    .or_default();
+                values.rotations_timeline = inputs;
+                values.rotations = outputs;
+            }
+            Some(gltf::animation::util::ReadOutputs::Scales(scales)) => {
+                let mut outputs = Vec::new();
+                for scale in scales {
+                    outputs.push(glam::Vec3::from_array(scale));
+                }
+
+                let values = node_animation_values
+                    .entry(channel.target().node().index())
+                    .or_default();
+                values.scales_timeline = inputs;
+                values.scales = outputs;
+            }
+            Some(gltf::animation::util::ReadOutputs::MorphTargetWeights(morph_target_weights)) => {
+                let mut outputs = Vec::new();
+                for weight in morph_target_weights.into_f32() {
+                    outputs.push(weight);
+                }
+                log(&format!("morph weights = {:?}", &outputs));
+            }
+            None => log("it's nothing"),
+        }
+    }
+
+    Animation {
+        name: gltf_animation.name().map(|s| s.into()),
+        node_values: node_animation_values,
+    }
+}
+
 struct VertexMeshInstance {
-    index: usize,
+    mesh_index: usize,
     transform: glam::f32::Mat4,
 }
 
-fn load_scene_nodes(gltf_node: &gltf::Node) -> Vec<VertexMeshInstance> {
+fn load_scene_nodes(
+    gltf_node: &gltf::Node,
+) -> std::collections::BTreeMap<usize, VertexMeshInstance> {
     log(&format!("Node name = {:?}", gltf_node.name()));
     if let Some(_cam) = gltf_node.camera() {
         log("Node has a camera! Ignored, as cameras are not yet implemented");
@@ -477,19 +571,25 @@ fn load_scene_nodes(gltf_node: &gltf::Node) -> Vec<VertexMeshInstance> {
         glam::Quat::from_array(rotation),
         glam::Vec3::from(translation),
     );
-    let mut nodes = Vec::new();
+    let mut nodes = std::collections::BTreeMap::new();
     for child in gltf_node.children() {
         nodes.extend(load_scene_nodes(&child));
     }
 
-    for node in &mut nodes {
+    for (_index, node) in &mut nodes {
         node.transform = transform * node.transform;
     }
 
     if let Some(mesh) = gltf_node.mesh() {
         let index = mesh.index();
 
-        nodes.push(VertexMeshInstance { index, transform });
+        nodes.insert(
+            gltf_node.index(),
+            VertexMeshInstance {
+                mesh_index: index,
+                transform,
+            },
+        );
     }
 
     nodes

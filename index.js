@@ -43,28 +43,28 @@ import('./pkg')
   .catch(console.error);
 
 const models = [
-  FlowerGLB,
-  StorkGLB,
-  FlamingoGLB,
-  CollisionWorldGLB,
-  ParrotGLB,
-  HorseGLB,
-  ClearcoatTestGLB,
-  FacecapGLB,
-  ShadowmappableMeshGLB,
-  LeePerrySmithGLB,
-  RobotExpressiveGLB,
-  NefertitiGLB,
-  FerrariGLB,
-  SoldierGLB,
-  XbotGLB,
-  IridescentDishWithOlivesGLB,
-  LittlestTokyoGLB,
-  SheenChairGLB,
-  CoffeematGLB,
-  IridescenceLampGLB,
-  PrimaryIonDriveGLB,
-  BoomBoxGLB,
+  { name: "Flower", path: FlowerGLB },
+  { name: "Stork", path: StorkGLB },
+  { name: "Flamingo", path: FlamingoGLB },
+  { name: "CollisionWorld", path: CollisionWorldGLB },
+  { name: "Parrot", path: ParrotGLB },
+  { name: "Horse", path: HorseGLB },
+  { name: "ClearcoatTest", path: ClearcoatTestGLB },
+  { name: "Facecap", path: FacecapGLB },
+  { name: "ShadowmappableMesh", path: ShadowmappableMeshGLB },
+  { name: "LeePerrySmith", path: LeePerrySmithGLB },
+  { name: "RobotExpressive", path: RobotExpressiveGLB },
+  { name: "Nefertiti", path: NefertitiGLB },
+  { name: "Ferrari", path: FerrariGLB },
+  { name: "Soldier", path: SoldierGLB },
+  { name: "Xbot", path: XbotGLB },
+  { name: "IridescentDishWithOlives", path: IridescentDishWithOlivesGLB },
+  { name: "LittlestTokyo", path: LittlestTokyoGLB },
+  { name: "SheenChair", path: SheenChairGLB },
+  { name: "Coffeemat", path: CoffeematGLB },
+  { name: "IridescenceLamp", path: IridescenceLampGLB },
+  { name: "PrimaryIonDrive", path: PrimaryIonDriveGLB },
+  { name: "BoomBox", path: BoomBoxGLB },
 ];
 
 
@@ -74,8 +74,8 @@ function setup_model_buttons(fetch_and_display_model) {
   for (let i = 0; i < models.length; i += 1) {
     const button = document.createElement("button");
     
-    button.innerText = `Load ${models[i]}`;
-    button.addEventListener("click", () => fetch_and_display_model(models[i]));
+    button.innerText = `Load ${models[i].name}`;
+    button.addEventListener("click", () => fetch_and_display_model(models[i].path));
     
     const li = document.createElement("li");
     li.appendChild(button);
