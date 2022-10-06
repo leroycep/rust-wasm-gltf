@@ -25,7 +25,7 @@ import FerrariGLB from "./gltf/ferrari.glb";
 // example.
 import('./pkg')
   .then(m => {
-    setup_model_buttons(async model_path => {
+    const load_model_at_path = async model_path => {
       // Stop the previous renderer if there is one
       m.quit_rendering();
     
@@ -38,7 +38,9 @@ import('./pkg')
       const gltf_bytes = await resp.arrayBuffer();
       console.log(gltf_bytes);
       m.load_gltf_model(new Uint8Array(gltf_bytes));
-    })
+    };
+    setup_model_buttons(load_model_at_path);
+    load_model_at_path(SoldierGLB);
   })
   .catch(console.error);
 

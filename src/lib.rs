@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{WebGl2RenderingContext, WebGlProgram, WebGlShader};
+use web_sys::{WebGl2RenderingContext, WebGlProgram, WebGlShader, WebGlUniformLocation};
 
 pub fn compile_shader(
     context: &WebGl2RenderingContext,
@@ -85,10 +85,10 @@ pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<(), JsValue> {
         ));
     }
 
-    let mut model = std::collections::BTreeMap::new();
+    let mut root_nodes = Vec::new();
     if let Some(scene) = document.default_scene() {
         for node in scene.nodes() {
-            model.extend(load_scene_nodes(&node));
+            root_nodes.push(load_scene_nodes(&node));
         }
     }
 
@@ -97,14 +97,15 @@ pub fn load_gltf_model(gltf_bytes: Box<[u8]>) -> Result<(), JsValue> {
         animations.push(load_animation(&animation, &buffers));
     }
 
-    Ok(display_model(&meshes, model)?)
+    Ok(display_model(&meshes, root_nodes, animations)?)
 }
 
 static QUIT_RENDERING: AtomicBool = AtomicBool::new(false);
 
 fn display_model(
     meshes: &[VertexMesh],
-    model: std::collections::BTreeMap<usize, VertexMeshInstance>,
+    model: Vec<VertexMeshInstance>,
+    animations: Vec<Animation>,
 ) -> Result<(), JsValue> {
     let window = web_sys::window().unwrap();
     let performance = window.performance().unwrap();
@@ -244,20 +245,36 @@ fn display_model(
         )?);
     }
 
+    let animation_index = 1;
+    log(&format!(
+        "playing animations[{}] = {}",
+        animation_index,
+        animations[animation_index].name.as_ref().unwrap()
+    ));
+    log(&format!(
+        "animations[{}] = {:?}",
+        animation_index,
+        &animations[animation_index]
+            .node_values
+            .keys()
+            .collect::<Vec<_>>()
+    ));
+    for root_node in &model {
+        root_node.dump_debug_info();
+    }
+
     let mut min = glam::vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
     let mut max = glam::vec3(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for (_node_index, mesh_instance) in &model {
-        log(&format!("transform = {}", mesh_instance.transform));
-        min = min.min(
-            mesh_instance
-                .transform
-                .transform_point3(meshes[mesh_instance.mesh_index].min),
+    for mesh_instance in &model {
+        log(&format!("transform = {}", mesh_instance.local_transform()));
+        let (mesh_min, mesh_max) = animations[animation_index].min_max_bounds(
+            &meshes,
+            mesh_instance,
+            glam::Mat4::IDENTITY,
+            0.0,
         );
-        max = max.max(
-            mesh_instance
-                .transform
-                .transform_point3(meshes[mesh_instance.mesh_index].max),
-        );
+        min = min.min(mesh_min);
+        max = max.max(mesh_max);
     }
     let size = (max - min).max_element();
     let center = (min + max) / 2.0;
@@ -323,52 +340,15 @@ fn display_model(
         context.uniform3fv_with_f32_array(Some(&light_pos_uniform), &light_pos.to_array());
         context.uniform3fv_with_f32_array(Some(&view_pos_uniform), &camera_pos.to_array());
 
-        for (_node_index, instance) in &model {
-            let gpu_mesh = &gpu_meshes[instance.mesh_index];
-
-            let model_transform = model_scale * model_offset * instance.transform;
-            context.uniform_matrix4fv_with_f32_array(
-                Some(&model_transform_uniform),
-                false,
-                &model_transform.to_cols_array(),
-            );
-
-            context.bind_buffer(
-                WebGl2RenderingContext::ARRAY_BUFFER,
-                Some(&gpu_mesh.vertex_buffer),
-            );
-            context.bind_buffer(
-                WebGl2RenderingContext::ELEMENT_ARRAY_BUFFER,
-                Some(&gpu_mesh.index_buffer),
-            );
-
-            let position_attribute = context.get_attrib_location(&program, "position");
-            let normal_attribute = context.get_attrib_location(&program, "aNormal");
-
-            context.vertex_attrib_pointer_with_i32(
-                position_attribute as u32,
-                3,
-                WebGl2RenderingContext::FLOAT,
-                false,
-                (6 * size_of::<f32>()) as i32,
-                0,
-            );
-            context.enable_vertex_attrib_array(position_attribute as u32);
-            context.vertex_attrib_pointer_with_i32(
-                normal_attribute as u32,
-                3,
-                WebGl2RenderingContext::FLOAT,
-                false,
-                (6 * size_of::<f32>()) as i32,
-                (3 * size_of::<f32>()) as i32,
-            );
-            context.enable_vertex_attrib_array(normal_attribute as u32);
-
-            context.draw_elements_with_i32(
-                WebGl2RenderingContext::TRIANGLES,
-                gpu_mesh.num_indices,
-                WebGl2RenderingContext::UNSIGNED_SHORT,
-                0,
+        for root_node in &model {
+            animations[animation_index].render(
+                &context,
+                &program,
+                &model_transform_uniform,
+                root_node,
+                &gpu_meshes,
+                model_scale * model_offset,
+                time,
             );
         }
 
@@ -384,52 +364,15 @@ fn display_model(
             false,
             &view_matrix.to_cols_array(),
         );
-        for (_node_index, instance) in &model {
-            let line_mesh = &line_gpu_meshes[instance.mesh_index];
-
-            let model_transform = model_scale * model_offset * instance.transform;
-            context.uniform_matrix4fv_with_f32_array(
-                Some(&line_model_uniform),
-                false,
-                &model_transform.to_cols_array(),
-            );
-
-            context.bind_buffer(
-                WebGl2RenderingContext::ARRAY_BUFFER,
-                Some(&line_mesh.vertex_buffer),
-            );
-            context.bind_buffer(
-                WebGl2RenderingContext::ELEMENT_ARRAY_BUFFER,
-                Some(&line_mesh.index_buffer),
-            );
-
-            let position_attribute = context.get_attrib_location(&line_program, "position");
-            let normal_attribute = context.get_attrib_location(&line_program, "aNormal");
-
-            context.vertex_attrib_pointer_with_i32(
-                position_attribute as u32,
-                3,
-                WebGl2RenderingContext::FLOAT,
-                false,
-                (6 * size_of::<f32>()) as i32,
-                0,
-            );
-            context.enable_vertex_attrib_array(position_attribute as u32);
-            context.vertex_attrib_pointer_with_i32(
-                normal_attribute as u32,
-                3,
-                WebGl2RenderingContext::FLOAT,
-                false,
-                (6 * size_of::<f32>()) as i32,
-                (3 * size_of::<f32>()) as i32,
-            );
-            context.enable_vertex_attrib_array(normal_attribute as u32);
-
-            context.draw_elements_with_i32(
-                WebGl2RenderingContext::LINES,
-                line_mesh.num_indices,
-                WebGl2RenderingContext::UNSIGNED_SHORT,
-                0,
+        for root_node in &model {
+            animations[animation_index].render_line(
+                &context,
+                &line_program,
+                &line_model_uniform,
+                root_node,
+                &line_gpu_meshes,
+                model_scale * model_offset,
+                time,
             );
         }
 
@@ -474,6 +417,287 @@ struct Animation {
     node_values: std::collections::BTreeMap<usize, NodeAnimationValues>,
 }
 
+impl Animation {
+    pub fn min_max_bounds(
+        &self,
+        meshes: &[VertexMesh],
+        mesh_instance: &VertexMeshInstance,
+        parent_transform: glam::Mat4,
+        time_since_start: f32,
+    ) -> (glam::Vec3, glam::Vec3) {
+        let mut min = glam::vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+        let mut max = glam::vec3(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+
+        let animation_transform = self.transform_at_time_for_node(time_since_start, mesh_instance);
+
+        let transform = parent_transform * animation_transform;
+
+        if let Some(mesh_index) = mesh_instance.mesh_index {
+            min = min.min(transform.transform_point3(meshes[mesh_index].min));
+            max = max.max(transform.transform_point3(meshes[mesh_index].max));
+        }
+        for child in &mesh_instance.children {
+            let (mesh_min, mesh_max) =
+                self.min_max_bounds(meshes, child, transform, time_since_start);
+            min = min.min(mesh_min);
+            max = max.max(mesh_max);
+        }
+
+        (min, max)
+    }
+
+    pub fn render(
+        &self,
+        context: &WebGl2RenderingContext,
+        program: &WebGlProgram,
+        model_transform_uniform: &WebGlUniformLocation,
+        mesh_instance: &VertexMeshInstance,
+        meshes: &[GpuMesh],
+        parent_transform: glam::f32::Mat4,
+        time_since_start: f32,
+    ) {
+        let animation_transform = self.transform_at_time_for_node(time_since_start, mesh_instance);
+
+        let model_transform = parent_transform * animation_transform;
+
+        if let Some(mesh_index) = mesh_instance.mesh_index {
+            let gpu_mesh = &meshes[mesh_index];
+            context.uniform_matrix4fv_with_f32_array(
+                Some(&model_transform_uniform),
+                false,
+                &model_transform.to_cols_array(),
+            );
+
+            context.bind_buffer(
+                WebGl2RenderingContext::ARRAY_BUFFER,
+                Some(&gpu_mesh.vertex_buffer),
+            );
+            context.bind_buffer(
+                WebGl2RenderingContext::ELEMENT_ARRAY_BUFFER,
+                Some(&gpu_mesh.index_buffer),
+            );
+
+            let position_attribute = context.get_attrib_location(program, "position");
+            let normal_attribute = context.get_attrib_location(program, "aNormal");
+
+            context.vertex_attrib_pointer_with_i32(
+                position_attribute as u32,
+                3,
+                WebGl2RenderingContext::FLOAT,
+                false,
+                (6 * size_of::<f32>()) as i32,
+                0,
+            );
+            context.enable_vertex_attrib_array(position_attribute as u32);
+            context.vertex_attrib_pointer_with_i32(
+                normal_attribute as u32,
+                3,
+                WebGl2RenderingContext::FLOAT,
+                false,
+                (6 * size_of::<f32>()) as i32,
+                (3 * size_of::<f32>()) as i32,
+            );
+            context.enable_vertex_attrib_array(normal_attribute as u32);
+
+            context.draw_elements_with_i32(
+                WebGl2RenderingContext::TRIANGLES,
+                gpu_mesh.num_indices,
+                WebGl2RenderingContext::UNSIGNED_SHORT,
+                0,
+            );
+        }
+
+        for child in mesh_instance.children.iter() {
+            self.render(
+                context,
+                program,
+                model_transform_uniform,
+                child,
+                meshes,
+                model_transform,
+                time_since_start,
+            );
+        }
+    }
+
+    pub fn render_line(
+        &self,
+        context: &WebGl2RenderingContext,
+        program: &WebGlProgram,
+        model_transform_uniform: &WebGlUniformLocation,
+        mesh_instance: &VertexMeshInstance,
+        meshes: &[GpuMesh],
+        parent_transform: glam::f32::Mat4,
+        time_since_start: f32,
+    ) {
+        let animation_transform = self.transform_at_time_for_node(time_since_start, mesh_instance);
+
+        let model_transform = parent_transform * animation_transform;
+
+        if let Some(mesh_index) = mesh_instance.mesh_index {
+            let gpu_mesh = &meshes[mesh_index];
+            context.uniform_matrix4fv_with_f32_array(
+                Some(&model_transform_uniform),
+                false,
+                &model_transform.to_cols_array(),
+            );
+
+            context.bind_buffer(
+                WebGl2RenderingContext::ARRAY_BUFFER,
+                Some(&gpu_mesh.vertex_buffer),
+            );
+            context.bind_buffer(
+                WebGl2RenderingContext::ELEMENT_ARRAY_BUFFER,
+                Some(&gpu_mesh.index_buffer),
+            );
+
+            let position_attribute = context.get_attrib_location(program, "position");
+            let normal_attribute = context.get_attrib_location(program, "aNormal");
+
+            context.vertex_attrib_pointer_with_i32(
+                position_attribute as u32,
+                3,
+                WebGl2RenderingContext::FLOAT,
+                false,
+                (6 * size_of::<f32>()) as i32,
+                0,
+            );
+            context.enable_vertex_attrib_array(position_attribute as u32);
+            context.vertex_attrib_pointer_with_i32(
+                normal_attribute as u32,
+                3,
+                WebGl2RenderingContext::FLOAT,
+                false,
+                (6 * size_of::<f32>()) as i32,
+                (3 * size_of::<f32>()) as i32,
+            );
+            context.enable_vertex_attrib_array(normal_attribute as u32);
+
+            context.draw_elements_with_i32(
+                WebGl2RenderingContext::LINES,
+                gpu_mesh.num_indices,
+                WebGl2RenderingContext::UNSIGNED_SHORT,
+                0,
+            );
+        } else {
+            // For now, render mesh[0] just to check that the skeleton is being animated
+            let gpu_mesh = &meshes[0];
+            context.uniform_matrix4fv_with_f32_array(
+                Some(&model_transform_uniform),
+                false,
+                &model_transform.to_cols_array(),
+            );
+
+            context.bind_buffer(
+                WebGl2RenderingContext::ARRAY_BUFFER,
+                Some(&gpu_mesh.vertex_buffer),
+            );
+            context.bind_buffer(
+                WebGl2RenderingContext::ELEMENT_ARRAY_BUFFER,
+                Some(&gpu_mesh.index_buffer),
+            );
+
+            let position_attribute = context.get_attrib_location(program, "position");
+            let normal_attribute = context.get_attrib_location(program, "aNormal");
+
+            context.vertex_attrib_pointer_with_i32(
+                position_attribute as u32,
+                3,
+                WebGl2RenderingContext::FLOAT,
+                false,
+                (6 * size_of::<f32>()) as i32,
+                0,
+            );
+            context.enable_vertex_attrib_array(position_attribute as u32);
+            context.vertex_attrib_pointer_with_i32(
+                normal_attribute as u32,
+                3,
+                WebGl2RenderingContext::FLOAT,
+                false,
+                (6 * size_of::<f32>()) as i32,
+                (3 * size_of::<f32>()) as i32,
+            );
+            context.enable_vertex_attrib_array(normal_attribute as u32);
+
+            context.draw_elements_with_i32(
+                WebGl2RenderingContext::LINES,
+                gpu_mesh.num_indices,
+                WebGl2RenderingContext::UNSIGNED_SHORT,
+                0,
+            );
+        }
+
+        for child in mesh_instance.children.iter() {
+            self.render_line(
+                context,
+                program,
+                model_transform_uniform,
+                child,
+                meshes,
+                model_transform,
+                time_since_start,
+            );
+        }
+    }
+
+    pub fn transform_at_time_for_node(
+        &self,
+        time_since_start: f32,
+        mesh_instance: &VertexMeshInstance,
+    ) -> glam::Mat4 {
+        let mut translation = mesh_instance.translation;
+        let mut rotation = mesh_instance.rotation;
+        let mut scale = mesh_instance.scale;
+
+        if let Some(node) = self.node_values.get(&mesh_instance.node_index) {
+            let current_time = time_since_start % node.translations_timeline.last().unwrap();
+
+            for (time_index, next_time) in node.translations_timeline.iter().enumerate() {
+                if *next_time > current_time && time_index > 0 {
+                    let prev_time = node.translations_timeline[time_index - 1];
+                    let fraction_towards_next_time =
+                        (current_time - prev_time) / (next_time - prev_time);
+
+                    let next_translation = node.translations[time_index];
+                    let prev_translation = node.translations[time_index - 1];
+                    translation = prev_translation
+                        + fraction_towards_next_time * (next_translation - prev_translation);
+                    break;
+                }
+            }
+
+            for (time_index, next_time) in node.rotations_timeline.iter().enumerate() {
+                if *next_time > current_time && time_index > 0 {
+                    let prev_time = node.rotations_timeline[time_index - 1];
+                    let fraction_towards_next_time =
+                        (current_time - prev_time) / (next_time - prev_time);
+
+                    let next_rotation = node.rotations[time_index];
+                    let prev_rotation = node.rotations[time_index - 1];
+                    rotation = prev_rotation
+                        + (next_rotation - prev_rotation) * fraction_towards_next_time;
+                    break;
+                }
+            }
+
+            for (time_index, next_time) in node.scales_timeline.iter().enumerate() {
+                if *next_time > current_time && time_index > 0 {
+                    let prev_time = node.scales_timeline[time_index - 1];
+                    let fraction_towards_next_time =
+                        (current_time - prev_time) / (next_time - prev_time);
+
+                    let next_scale = node.scales[time_index];
+                    let prev_scale = node.scales[time_index - 1];
+                    scale = prev_scale + fraction_towards_next_time * (next_scale - prev_scale);
+                    break;
+                }
+            }
+        }
+
+        glam::Mat4::from_scale_rotation_translation(scale, rotation, translation)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct NodeAnimationValues {
     translations_timeline: Vec<f32>,
@@ -491,6 +715,8 @@ fn load_animation(gltf_animation: &gltf::Animation, buffers: &[gltf::buffer::Dat
     let mut node_animation_values: std::collections::BTreeMap<usize, NodeAnimationValues> =
         std::collections::BTreeMap::new();
     for channel in gltf_animation.channels() {
+        log(&format!("{:?}", channel.sampler().interpolation()));
+
         let reader = channel.reader(|buffer| Some(&buffers[buffer.index()]));
 
         let mut inputs = Vec::new();
@@ -552,47 +778,81 @@ fn load_animation(gltf_animation: &gltf::Animation, buffers: &[gltf::buffer::Dat
     }
 }
 
+#[derive(Debug)]
 struct VertexMeshInstance {
-    mesh_index: usize,
-    transform: glam::f32::Mat4,
+    node_index: usize,
+    mesh_index: Option<usize>,
+
+    translation: glam::f32::Vec3,
+    rotation: glam::f32::Quat,
+    scale: glam::f32::Vec3,
+
+    children: Vec<VertexMeshInstance>,
 }
 
-fn load_scene_nodes(
-    gltf_node: &gltf::Node,
-) -> std::collections::BTreeMap<usize, VertexMeshInstance> {
+impl VertexMeshInstance {
+    pub fn local_transform(&self) -> glam::Mat4 {
+        glam::Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
+    }
+
+    pub fn min_max_bounds(
+        &self,
+        meshes: &[VertexMesh],
+        parent_transform: glam::Mat4,
+    ) -> (glam::Vec3, glam::Vec3) {
+        let mut min = glam::vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+        let mut max = glam::vec3(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+
+        if let Some(mesh_index) = self.mesh_index {
+            let transform = parent_transform * self.local_transform();
+            min = min.min(transform.transform_point3(meshes[mesh_index].min));
+            max = max.max(transform.transform_point3(meshes[mesh_index].max));
+        }
+        for child in &self.children {
+            let (mesh_min, mesh_max) =
+                child.min_max_bounds(meshes, parent_transform * self.local_transform());
+            min = min.min(mesh_min);
+            max = max.max(mesh_max);
+        }
+
+        (min, max)
+    }
+
+    pub fn dump_debug_info(&self) {
+        log(&format!(
+            "node_id = {}, mesh_index = {:?}, num_children = {}",
+            self.node_index,
+            self.mesh_index,
+            self.children.len()
+        ));
+
+        for child in &self.children {
+            child.dump_debug_info();
+        }
+    }
+}
+
+fn load_scene_nodes(gltf_node: &gltf::Node) -> VertexMeshInstance {
     log(&format!("Node name = {:?}", gltf_node.name()));
     if let Some(_cam) = gltf_node.camera() {
         log("Node has a camera! Ignored, as cameras are not yet implemented");
     }
 
     let (translation, rotation, scale) = gltf_node.transform().decomposed();
-    let transform = glam::Mat4::from_scale_rotation_translation(
-        glam::Vec3::from(scale),
-        glam::Quat::from_array(rotation),
-        glam::Vec3::from(translation),
-    );
-    let mut nodes = std::collections::BTreeMap::new();
+
+    let mut children = Vec::new();
     for child in gltf_node.children() {
-        nodes.extend(load_scene_nodes(&child));
+        children.push(load_scene_nodes(&child));
     }
 
-    for (_index, node) in &mut nodes {
-        node.transform = transform * node.transform;
+    VertexMeshInstance {
+        node_index: gltf_node.index(),
+        mesh_index: gltf_node.mesh().map(|mesh| mesh.index()),
+        translation: glam::Vec3::from_array(translation),
+        rotation: glam::Quat::from_array(rotation),
+        scale: glam::Vec3::from_array(scale),
+        children,
     }
-
-    if let Some(mesh) = gltf_node.mesh() {
-        let index = mesh.index();
-
-        nodes.insert(
-            gltf_node.index(),
-            VertexMeshInstance {
-                mesh_index: index,
-                transform,
-            },
-        );
-    }
-
-    nodes
 }
 
 struct VertexMesh {
